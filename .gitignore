@@ -3,6 +3,7 @@ backend/__pycache__/
 backend/memory.db
 data/
 backend/vector_index/
+backend/models/
 .vscode/
 
 frontend/node_modules/

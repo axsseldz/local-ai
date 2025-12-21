@@ -5,3 +5,5 @@ httpx
 faiss-cpu 
 pymupdf
 python-multipart
+faster-whisper
+vosk

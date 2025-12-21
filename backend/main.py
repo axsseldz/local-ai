@@ -1,23 +1,25 @@
 from contextlib import asynccontextmanager
 from db import init_db, add_memory, search_memory
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from embeddings import embed_texts
 from faiss_store import search as faiss_search
 from db import get_chunks_by_vector_ids
 from pathlib import Path
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 from index import run_index  
-from fastapi import UploadFile, File
 from typing import Any
+from vosk import Model, KaldiRecognizer
 import httpx
 import faiss
 import json
 import asyncio
 import os
 import re
+import tempfile
+import subprocess
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
@@ -25,6 +27,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # local-ai/
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_INTERVAL_SECONDS = 180  # 3 minutes (tune later)
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")  # tiny | base | small | medium
+_WHISPER_MODEL = None  # lazy-loaded singleton
+VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
+_vosk_model = None
 
 INDEX_LOCK = asyncio.Lock()
 INDEX_STATUS = {
@@ -36,6 +42,33 @@ INDEX_STATUS = {
     "last_error": None,
     "stats": None,
 }
+
+def get_vosk_model():
+    global _vosk_model
+    if _vosk_model is None:
+        if not VOSK_MODEL_PATH.exists():
+            raise RuntimeError(f"Vosk model not found at: {VOSK_MODEL_PATH}")
+        _vosk_model = Model(str(VOSK_MODEL_PATH))
+    return _vosk_model
+
+def _get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as e:
+            raise RuntimeError(
+                "Missing dependency for voice: `faster-whisper`. "
+                "Install with: pip install faster-whisper"
+            ) from e
+
+        # CPU-friendly defaults. (Works great on Mac; you can tune later.)
+        _WHISPER_MODEL = WhisperModel(
+            WHISPER_MODEL_NAME,
+            device="cpu",
+            compute_type="int8",
+        )
+    return _WHISPER_MODEL
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -406,6 +439,62 @@ async def route_auto(question: str, task: str, top_k: int, model: str) -> dict[s
 def health():
     return {"status": "ok"}
 
+@app.post("/voice/transcribe")
+async def voice_transcribe(file: UploadFile = File(...)):
+    """
+    Local speech-to-text.
+    Frontend sends a recorded audio blob (webm/m4a/etc).
+    We normalize with ffmpeg -> wav(16k, mono) then run Whisper locally.
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing audio file")
+
+    # Save upload to temp
+    suffix = Path(file.filename or "audio").suffix or ".webm"
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        src_path = td_path / f"input{suffix}"
+        wav_path = td_path / "audio.wav"
+
+        src_path.write_bytes(await file.read())
+
+        # Convert to 16k mono wav for consistent Whisper input
+        # Requires: brew install ffmpeg
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(wav_path),
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg failed. Install with: brew install ffmpeg",
+            )
+
+        try:
+            model = _get_whisper_model()
+            segments, info = model.transcribe(
+                str(wav_path),
+                beam_size=1,
+                vad_filter=True,
+            )
+            text = "".join(seg.text for seg in segments).strip()
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Transcription error: {type(e).__name__}: {str(e)}")
+
+    return {"text": text}
+
 @app.get("/docs/list")
 def docs_list():
     items = []
@@ -698,5 +787,46 @@ async def ask_stream(req: AskRequest):
         yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(sse(), media_type="text/event-stream")
+
+@app.websocket("/voice/stt/ws")
+async def voice_stt_ws(ws: WebSocket):
+    await ws.accept()
+
+    try:
+        model = get_vosk_model()
+    except Exception as e:
+        await ws.send_json({"type": "error", "message": str(e)})
+        await ws.close()
+        return
+
+    # El frontend enviará PCM16 mono 16kHz
+    recognizer = KaldiRecognizer(model, 16000)
+    recognizer.SetWords(True)
+
+    partial_last = ""
+
+    try:
+        while True:
+            data = await ws.receive_bytes()  # raw PCM16 bytes
+            if recognizer.AcceptWaveform(data):
+                res = json.loads(recognizer.Result())
+                text = (res.get("text") or "").strip()
+                if text:
+                    await ws.send_json({"type": "final", "text": text})
+                    partial_last = ""
+            else:
+                pres = json.loads(recognizer.PartialResult())
+                p = (pres.get("partial") or "").strip()
+                # evita spamear si no cambió
+                if p and p != partial_last:
+                    partial_last = p
+                    await ws.send_json({"type": "partial", "text": p})
+
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        await ws.send_json({"type": "error", "message": str(e)})
+        await ws.close()
+
 
 

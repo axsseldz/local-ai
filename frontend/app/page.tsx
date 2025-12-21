@@ -68,6 +68,36 @@ function uid(prefix = "m") {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function floatTo16BitPCM(float32: Float32Array) {
+  const out = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+// downsample to 16kHz mono (simple + efectivo para MVP)
+function downsampleBuffer(buffer: Float32Array, sampleRate: number, outRate = 16000) {
+  if (outRate === sampleRate) return buffer;
+  const ratio = sampleRate / outRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let offset = 0;
+  for (let i = 0; i < newLen; i++) {
+    const nextOffset = Math.round((i + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+    for (let j = offset; j < nextOffset && j < buffer.length; j++) {
+      sum += buffer[j];
+      count++;
+    }
+    result[i] = count ? sum / count : 0;
+    offset = nextOffset;
+  }
+  return result;
+}
+
 export default function Page() {
   const [question, setQuestion] = useState("");
   const [mode, setMode] = useState<Mode>("auto");
@@ -79,9 +109,21 @@ export default function Page() {
   const [docs, setDocs] = useState<DocItem[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<string>(""); // filename
   const [uploading, setUploading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [micError, setMicError] = useState("");
 
-
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+  const finalTranscriptRef = useRef<string>("");
   const chatRef = useRef<HTMLDivElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const [liveTranscript, setLiveTranscript] = useState(""); // texto parcial live
+
+
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
@@ -116,150 +158,7 @@ export default function Page() {
 
 
   async function ask() {
-    const q = question.trim();
-    if (!q || loading) return;
-
-    setLoading(true);
-    setError("");
-
-    const userMsg: ChatMessage = {
-      id: uid("u"),
-      role: "user",
-      content: q,
-      createdAt: Date.now(),
-      mode,
-    };
-
-    const assistantId = uid("a");
-    const pendingAssistant: ChatMessage = {
-      id: assistantId,
-      role: "assistant",
-      content: "Thinking…",
-      createdAt: Date.now(),
-    };
-
-    setMessages((prev) => [...prev, userMsg, pendingAssistant]);
-    setQuestion("");
-
-    try {
-      const res = await fetch("http://localhost:8000/ask/stream", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify({ question: q, mode, top_k: 10 }),
-      });
-
-      if (!res.ok || !res.body) {
-        throw new Error(`Streaming failed: ${res.status}`);
-      }
-
-      // Start assistant message as empty (instead of "Thinking…")
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, content: "" } : m
-        )
-      );
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-
-      let buffer = "";
-      let metaApplied = false;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // SSE frames are separated by a blank line
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() || "";
-
-        for (const frame of frames) {
-          const lines = frame.split("\n").filter(Boolean);
-
-          let eventName = "message";
-          const dataLines: string[] = [];
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              eventName = line.slice("event:".length).trim();
-            } else if (line.startsWith("data:")) {
-              // keep exact spacing from server
-              dataLines.push(line.slice("data:".length));
-            }
-          }
-
-          const data = dataLines.join("\n");
-
-          if (eventName === "meta") {
-            // meta contains mode/task/sources/model/retrieval
-            try {
-              const meta = JSON.parse(data);
-
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? {
-                      ...m,
-                      mode: meta.mode,
-                      task: meta.task,
-                      model: meta.model,
-                      sources: meta.sources || [],
-                      routing_reason: meta.routing_reason || undefined,
-                    }
-                    : m
-                )
-              );
-
-              metaApplied = true;
-            } catch {
-              // ignore bad meta
-            }
-            continue;
-          }
-
-          if (eventName === "done") {
-            continue;
-          }
-
-          // default "message": append token chunk
-          // If the backend sends leading spaces, preserve them
-          const chunk = data;
-
-          // Optional: if for some reason meta isn't sent, still stream text
-          if (!metaApplied) metaApplied = true;
-
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? { ...m, content: (m.content || "") + chunk }
-                : m
-            )
-          );
-        }
-      }
-    } catch {
-      const msg = "Could not reach backend. Is FastAPI running on http://localhost:8000 ?";
-      setError(msg);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId
-            ? {
-              ...m,
-              content: msg,
-              error: true,
-            }
-            : m
-        )
-      );
-    } finally {
-      setLoading(false);
-    }
-
+    await askWithText(question);
   }
 
   async function fetchDocs() {
@@ -314,6 +213,220 @@ export default function Page() {
       setTimeout(fetchIndexStatus, 400);
     } finally {
       setIndexStarting(false);
+    }
+  }
+
+  async function startRecording() {
+    setMicError("");
+    setLiveTranscript("");
+
+    if (isRecording) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicError("Your browser doesn't support microphone recording.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // 1) WS connect
+      const ws = new WebSocket("ws://localhost:8000/voice/stt/ws");
+      wsRef.current = ws;
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "partial") {
+            setLiveTranscript(msg.text || "");
+            // “preview” en textarea mientras hablas:
+            setQuestion(msg.text || "");
+          } else if (msg.type === "final") {
+            const finalText = (msg.text || "").trim();
+            if (finalText) {
+              finalTranscriptRef.current = finalText; // ✅ store final transcript
+              setQuestion(finalText);                 // ✅ show it in textarea
+            }
+          } else if (msg.type === "error") {
+            setMicError(msg.message || "STT error");
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onerror = () => setMicError("WebSocket error (backend down?)");
+      ws.onclose = () => { };
+
+      // 2) Audio graph -> ScriptProcessor -> PCM16 -> WS
+      const AudioCtx = (window.AudioContext || (window as any).webkitAudioContext);
+      const audioCtx = new AudioCtx();
+      audioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      // bufferSize 4096 es ok para MVP
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        const wsNow = wsRef.current;
+        if (!wsNow || wsNow.readyState !== WebSocket.OPEN) return;
+
+        const input = e.inputBuffer.getChannelData(0); // Float32
+        const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+        const pcm16 = floatTo16BitPCM(down);
+
+        wsNow.send(pcm16.buffer);
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      setIsRecording(true);
+    } catch (e: any) {
+      setMicError("Microphone permission denied or not available.");
+    }
+  }
+  const textToSend = (finalTranscriptRef.current || question).trim();
+  finalTranscriptRef.current = ""; // reset for next recording
+
+  function stopRecording() {
+    if (!isRecording) return;
+    setIsRecording(false);
+
+    // stop audio graph
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+
+    processorRef.current = null;
+    sourceRef.current = null;
+
+    // close audio context
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => { });
+      audioCtxRef.current = null;
+    }
+
+    // close websocket
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close();
+    }
+    wsRef.current = null;
+
+    // clear partial
+    setLiveTranscript("");
+
+    if (textToSend) {
+      setTimeout(() => askWithText(textToSend), 50);
+    }
+  }
+
+
+  function toggleRecording() {
+    if (isRecording) stopRecording();
+    else startRecording();
+  }
+
+  // Small helper so voice can send without relying on state timing
+  async function askWithText(text: string) {
+    const q = text.trim();
+    if (!q || loading) return;
+
+    setLoading(true);
+    setError("");
+
+    const userMsg: ChatMessage = {
+      id: uid("u"),
+      role: "user",
+      content: q,
+      createdAt: Date.now(),
+      mode,
+    };
+
+    const assistantId = uid("a");
+    const pendingAssistant: ChatMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "Thinking…",
+      createdAt: Date.now(),
+    };
+
+    setMessages((prev) => [...prev, userMsg, pendingAssistant]);
+    setQuestion("");
+
+    try {
+      const res = await fetch("http://localhost:8000/ask/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ question: q, mode, top_k: 10 }),
+      });
+
+      if (!res.ok || !res.body) throw new Error(`Streaming failed: ${res.status}`);
+
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, content: "" } : m)));
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      let buffer = "";
+      let metaApplied = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+
+        for (const frame of frames) {
+          const lines = frame.split("\n").filter(Boolean);
+          let eventName = "message";
+          const dataLines: string[] = [];
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) eventName = line.slice("event:".length).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice("data:".length));
+          }
+
+          const data = dataLines.join("\n");
+
+          if (eventName === "meta") {
+            try {
+              const meta = JSON.parse(data);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, mode: meta.mode, task: meta.task, model: meta.model, sources: meta.sources || [] }
+                    : m
+                )
+              );
+              metaApplied = true;
+            } catch { }
+            continue;
+          }
+
+          if (eventName === "done") continue;
+
+          const chunk = data;
+          if (!metaApplied) metaApplied = true;
+
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, content: (m.content || "") + chunk } : m))
+          );
+        }
+      }
+    } catch {
+      const msg = "Could not reach backend. Is FastAPI running on http://localhost:8000 ?";
+      setError(msg);
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, content: msg, error: true } : m)));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -639,23 +752,39 @@ export default function Page() {
                 placeholder='Try: "Summarize my resume in 3 bullets" or "How do computers work?"'
                 className="flex-1 min-h-16 w-200 h-16 resize-y rounded-2xl border border-slate-800/70 bg-[#0d131c] px-4 py-3 text-sm leading-relaxed transition outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 focus:border-slate-800/70"
               />
+              {/* Mic */}
+              <button
+                onClick={toggleRecording}
+                disabled={loading}
+                className={cx(
+                  "h-14 w-14 mb-1 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px",
+                  isRecording
+                    ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20 hover:shadow-[0_0_30px_rgba(244,63,94,0.25)] active:scale-[0.98]"
+                    : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)] active:scale-[0.98] active:border-cyan-300/70 active:bg-cyan-500/15"
+                )}
+                title={isRecording ? "Stop recording" : "Start recording"}
+              >
+                {isRecording ? "■" : "🎤"}
+              </button>
+
               <button
                 onClick={ask}
                 disabled={!canAsk}
                 className={cx(
                   "rounded-2xl px-4 py-2 h-14 mb-1 text-sm font-semibold transition relative overflow-hidden",
-                  canAsk
-                    ? "text-white shadow-lg shadow-slate-900/40"
-                    : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                  canAsk ? "text-white shadow-lg shadow-slate-900/40" : "bg-slate-800 text-slate-500 cursor-not-allowed"
                 )}
               >
-                {canAsk && (
-                  <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />
-                )}
-                <span className={cx("relative", canAsk ? "drop-shadow" : "")}>
-                  {loading ? "Generating…" : "Ask"}
-                </span>
+                {canAsk && <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />}
+                <span className={cx("relative", canAsk ? "drop-shadow" : "")}>{loading ? "Generating…" : "Ask"}</span>
               </button>
+            </div>
+
+            {/* mic error + option */}
+            <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
+              <div className="min-h-4">
+                {micError ? <span className="text-rose-300">{micError}</span> : null}
+              </div>
             </div>
           </div>
         </div>
