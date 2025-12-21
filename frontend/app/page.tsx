@@ -111,9 +111,9 @@ export default function Page() {
   const [uploading, setUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState("");
+  const [ttsEnabled, setTtsEnabled] = useState(true);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
+  const spokenRef = useRef<string>(""); // avoid double-speaking
   const finalTranscriptRef = useRef<string>("");
   const chatRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -159,6 +159,35 @@ export default function Page() {
 
   async function ask() {
     await askWithText(question);
+  }
+
+  function speak(text: string) {
+    if (!ttsEnabled) return;
+    if (!("speechSynthesis" in window)) return;
+
+    // Prevent re-speaking same message
+    if (spokenRef.current === text) return;
+    spokenRef.current = text;
+
+    window.speechSynthesis.cancel(); // stop previous speech
+
+    const utterance = new SpeechSynthesisUtterance(text);
+
+    // Optional tuning (Mac voices sound great)
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+
+    // Prefer a natural English voice
+    const voices = window.speechSynthesis.getVoices();
+    const preferred =
+      voices.find(v => v.name.includes("Samantha")) ||
+      voices.find(v => v.lang.startsWith("en")) ||
+      voices[0];
+
+    if (preferred) utterance.voice = preferred;
+
+    window.speechSynthesis.speak(utterance);
   }
 
   async function fetchDocs() {
@@ -352,6 +381,7 @@ export default function Page() {
       createdAt: Date.now(),
     };
 
+    spokenRef.current = ""; // allow speaking for this new answer
     setMessages((prev) => [...prev, userMsg, pendingAssistant]);
     setQuestion("");
 
@@ -371,6 +401,7 @@ export default function Page() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
+      let assistantText = ""; // ✅ accumulate streamed answer for TTS
 
       let buffer = "";
       let metaApplied = false;
@@ -411,13 +442,27 @@ export default function Page() {
             continue;
           }
 
-          if (eventName === "done") continue;
+          if (eventName === "done") {
+            const finalText = assistantText.trim();
+            if (finalText) {
+              speak(finalText); // 🔊 THIS WILL NOW WORK
+            }
+            continue;
+          };
 
           const chunk = data;
           if (!metaApplied) metaApplied = true;
 
+          // accumulate locally for TTS
+          assistantText += chunk;
+
+          // update UI
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, content: (m.content || "") + chunk } : m))
+            prev.map((m) =>
+              m.id === assistantId
+                ? { ...m, content: (m.content || "") + chunk }
+                : m
+            )
           );
         }
       }
@@ -765,6 +810,17 @@ export default function Page() {
                 title={isRecording ? "Stop recording" : "Start recording"}
               >
                 {isRecording ? "■" : "🎤"}
+              </button>
+
+              <button
+                onClick={() => {
+                  setTtsEnabled(v => !v);
+                  window.speechSynthesis.cancel(); // stop if muting mid-speech
+                }}
+                className="rounded-xl px-3 py-1.5 text-sm border border-zinc-300 dark:border-zinc-700
+             bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition"
+              >
+                {ttsEnabled ? "🔊 Voice On" : "🔇 Muted"}
               </button>
 
               <button
