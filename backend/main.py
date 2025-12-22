@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from index import run_index  
 from typing import Any
 from vosk import Model, KaldiRecognizer
+from dotenv import load_dotenv
 import httpx
 import faiss
 import json
@@ -32,6 +33,9 @@ _WHISPER_MODEL = None  # lazy-loaded singleton
 VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 _vosk_model = None
 
+BASE_DIR = Path(__file__).resolve().parents[1]  # local-ai/
+load_dotenv(BASE_DIR / ".env")
+
 INDEX_LOCK = asyncio.Lock()
 INDEX_STATUS = {
     "state": "idle",               # idle | running | ok | error
@@ -42,6 +46,67 @@ INDEX_STATUS = {
     "last_error": None,
     "stats": None,
 }
+
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+
+async def brave_web_search(query: str, count: int = 5):
+    """
+    Calls Brave Search API and returns normalized results:
+    [{label, title, url, snippet}]
+    """
+    if not BRAVE_SEARCH_API_KEY:
+        raise HTTPException(status_code=500, detail="BRAVE_SEARCH_API_KEY not set in .env")
+
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+    }
+
+    params = {
+        "q": query,
+        "count": count,
+        "search_lang": "en",
+        "safesearch": "moderate",
+        # You can add freshness like: "freshness": "week"
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(BRAVE_SEARCH_URL, headers=headers, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    results = []
+    web = (data or {}).get("web", {})
+    items = web.get("results", []) or []
+
+    for i, it in enumerate(items[:count]):
+        results.append({
+            "label": f"W{i+1}",
+            "title": it.get("title") or it.get("url") or f"Result {i+1}",
+            "url": it.get("url") or "",
+            "snippet": it.get("description") or "",
+        })
+
+    return results
+
+def build_web_prompt(question: str, results: list[dict]) -> str:
+    blocks = []
+    for r in results:
+        blocks.append(
+            f"[{r['label']}] {r.get('title','')}\nURL: {r.get('url','')}\nSnippet: {r.get('snippet','')}"
+        )
+
+    return (
+        "You are a privacy-first assistant.\n"
+        "Use ONLY the WEB SOURCES below to answer.\n"
+        "Keep the answer short by default; only go long if the user explicitly asks for detail.\n"
+        "Do NOT cite or mention source IDs or websites inside the answer.\n"
+        "If the sources don't contain enough info, say what is missing.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "WEB SOURCES:\n" + "\n\n".join(blocks) + "\n"
+    )
+
 
 def get_vosk_model():
     global _vosk_model
@@ -141,7 +206,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    mode: str = "auto"          # auto | local | general
+    mode: str = "auto"  # auto | local | general | search
     model: str | None = None
     top_k: int = 6
     task: str | None = None     # qa | summary | None (auto-infer)
@@ -326,13 +391,15 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
             "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
             "If important sections are missing, make a partial summary and say what seems missing.\n"
             "Follow the user's format request (e.g. bullet points).\n"
-            "Cite sources inline like [S1], [S2].\n"
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+            "Do NOT cite or mention source IDs or filenames in the answer.\n"
         )
     else:
         instructions = (
             "TASK: Answer using ONLY the provided SOURCES.\n"
             "If the answer cannot be found in the sources, say 'I don't know'.\n"
-            "Cite sources inline like [S1], [S2].\n"
+            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+            "Do NOT cite or mention source IDs or filenames in the answer.\n"
         )
 
     prompt = (
@@ -569,8 +636,14 @@ async def ask(req: AskRequest):
 
     # ---------- GENERAL MODE ----------
     async def run_general() -> dict:
+        prompt = (
+            "You are a helpful assistant.\n"
+            "Keep answers short by default; only go long if the user explicitly asks for a detailed/extended answer.\n"
+            "Do NOT invent source mentions.\n\n"
+            f"QUESTION:\n{req.question}\n"
+        )
         try:
-            answer = await ollama_generate(req.question, model)
+            answer = await ollama_generate(prompt, model)
         except httpx.ConnectError:
             raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
         except httpx.HTTPError as e:
@@ -645,13 +718,15 @@ async def ask(req: AskRequest):
                 "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
                 "If important sections are missing, make a partial summary and say what seems missing.\n"
                 "Follow the user's format request (e.g. bullet points).\n"
-                "Cite sources inline like [S1], [S2].\n"
+                "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+                "Do NOT cite or mention source IDs or filenames in the answer.\n"
             )
         else:
             instructions = (
                 "TASK: Answer using ONLY the provided SOURCES.\n"
                 "If the answer cannot be found in the sources, say 'I don't know'.\n"
-                "Cite sources inline like [S1], [S2].\n"
+                "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
+                "Do NOT cite or mention source IDs or filenames in the answer.\n"
             )
 
         prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
@@ -692,6 +767,34 @@ async def ask(req: AskRequest):
 
     if mode == "local":
         return await run_local()
+    
+    if mode == "search":
+    # Brave search -> local LLM synthesis
+        try:
+            results = await brave_web_search(req.question, count=5)
+            if not results:
+                return {
+                    "answer": "No web results found for that query.",
+                    "mode": "search",
+                    "task": task,
+                    "sources": [],
+                    "used_tools": ["brave_search", "ollama"],
+                    "model": model,
+                }
+
+            prompt = build_web_prompt(req.question, results)
+            answer = await ollama_generate(prompt, model)
+
+            return {
+                "answer": answer,
+                "mode": "search",
+                "task": task,
+                "sources": results,
+                "used_tools": ["brave_search", "ollama"],
+                "model": model,
+            }
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Brave Search error: {str(e)}")
 
     if mode == "auto":
         routed = await route_auto(req.question, task, req.top_k, model)
@@ -737,7 +840,34 @@ async def ask_stream(req: AskRequest):
         routing_reason = None
 
         if mode == "general":
-            prompt = req.question
+            prompt = (
+                "You are a helpful assistant.\n"
+                "Keep answers short by default; only go long if the user explicitly asks for a detailed/extended answer.\n"
+                "Do NOT invent source mentions.\n\n"
+                f"QUESTION:\n{req.question}\n"
+            )
+
+        elif mode == "search":
+            try:
+                results = await brave_web_search(req.question, count=5)
+            except httpx.HTTPError as e:
+                meta = {"mode": "search", "task": task, "sources": [], "model": model}
+                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                yield f"data: Brave Search error: {str(e)}\n\n"
+                yield "event: done\ndata: {}\n\n"
+                return
+
+            if not results:
+                meta = {"mode": "search", "task": task, "sources": [], "model": model}
+                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                yield "data: No web results found for that query.\n\n"
+                yield "event: done\ndata: {}\n\n"
+                return
+
+            sources = results
+            prompt = build_web_prompt(req.question, results)
+            final_mode = "search"
+
 
         elif mode == "local":
             prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
@@ -827,6 +957,3 @@ async def voice_stt_ws(ws: WebSocket):
     except Exception as e:
         await ws.send_json({"type": "error", "message": str(e)})
         await ws.close()
-
-
-

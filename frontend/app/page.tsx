@@ -5,13 +5,20 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
 
-type Mode = "auto" | "local" | "general";
+type Mode = "auto" | "local" | "general" | "search";
 
 type Source = {
   label: string;
-  doc_path: string;
-  chunk_index: number;
+
+  // local sources
+  doc_path?: string;
+  chunk_index?: number;
   score?: number | null;
+
+  // web sources
+  title?: string;
+  url?: string;
+  snippet?: string;
 };
 
 type AskResponse = {
@@ -59,6 +66,51 @@ type DocItem = {
   size: number;
   modified_at: string;
 };
+
+function formatAssistantContent(message: ChatMessage) {
+  if (message.role !== "assistant") return message.content;
+
+  const text = message.content || "";
+  if (!text.trim()) return text;
+
+  let formatted = text.replace(/\r\n/g, "\n");
+
+  // drop trailing {} or stray braces from LLM
+  formatted = formatted.replace(/\{?\s*\}\s*$/g, "").trim();
+
+  // remove inline citations like [S1], [W3]
+  formatted = formatted.replace(/\s*\[(S|W)\d+\]\s*/gi, " ");
+
+  // collapse spaced-out acronyms (e.g., "G P T" -> "GPT")
+  formatted = formatted.replace(/\b([A-Z](?:\s+[A-Z])+)\b/g, (m) => m.replace(/\s+/g, ""));
+
+  // collapse spaced-out numbers (e.g., "2 0 2 5" -> "2025")
+  formatted = formatted.replace(/\b(\d(?:\s+\d)+)\b/g, (m) => m.replace(/\s+/g, ""));
+
+  // fix split brand/name like "Py T orch" -> "PyTorch" (capitalized word, single capital, lower chunk)
+  formatted = formatted.replace(/\b([A-Z][a-z]+)\s+([A-Z])\s+([a-z]{2,})\b/g, (_m, a, b, c) => `${a}${b}${c}`);
+
+  formatted = formatted.replace(/\s+([.,;:!?])/g, "$1");
+  formatted = formatted.replace(/[ \t]{2,}/g, " ");
+
+  // encourage paragraph breaks after colons and before numbered items
+  formatted = formatted.replace(/:\s+(?=[A-Za-z0-9])/g, ":\n\n");
+  formatted = formatted.replace(/([.:;])\s*(\d+\.)\s+/g, "$1\n\n$2 ");
+  formatted = formatted.replace(/(\d+\.)\s+(?=\d+\.)/g, "$1\n\n");
+
+  // ensure bullets and paragraphs have breathing room
+  formatted = formatted
+    .replace(/([.:!?])\s*[-*•]\s+/g, "$1\n\n- ")
+    .replace(/\n\s*[-*•]\s+/g, "\n\n- ");
+
+  // add blank lines between sentences followed by capitalized starts to reduce wall-of-text
+  formatted = formatted.replace(/([.!?])\s+(?=[A-Z])/g, "$1\n\n");
+
+  formatted = formatted.replace(/\s*\*\*(.*?)\*\*\s*/g, (_m, inner) => ` **${(inner || "").trim()}** `);
+  formatted = formatted.replace(/\n{3,}/g, "\n\n");
+
+  return formatted.trim();
+}
 
 function cx(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
@@ -706,7 +758,10 @@ export default function Page() {
         >
           <div className="space-y-3">
             <AnimatePresence>
-              {messages.map((m) => (
+              {messages.map((m) => {
+                // Format assistant replies to look polished and readable
+                const formatted = m.role === "assistant" ? formatAssistantContent(m) : m.content;
+                return (
                 <motion.div
                   key={m.id}
                   initial={{ opacity: 0, y: 10 }}
@@ -744,7 +799,7 @@ export default function Page() {
                     {m.role === "assistant" && !m.error && m.content && m.content !== "Thinking…" && (
                       <button
                         className="rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-950/70 transition"
-                        onClick={() => navigator.clipboard.writeText(m.content)}
+                        onClick={() => navigator.clipboard.writeText(formatted || "")}
                         title="Copy answer"
                       >
                         Copy
@@ -755,7 +810,7 @@ export default function Page() {
                   <div className="px-5 pb-5">
                     {m.role === "assistant" ? (
                       <div className="prose prose-invert max-w-none leading-relaxed prose-p:my-3 prose-li:my-1">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>
                       </div>
                     ) : (
                       <div className="whitespace-pre-wrap text-sm text-slate-100 leading-relaxed">
@@ -776,34 +831,51 @@ export default function Page() {
                           </summary>
 
                           <div className="mt-3 grid gap-2">
-                            {m.sources.map((s) => (
-                              <div
-                                key={`${m.id}-${s.doc_path}-${s.chunk_index}-${s.label}`}
-                                className="rounded-2xl border border-slate-800/60 bg-slate-950/50 px-4 py-3"
-                              >
-                                <div className="flex items-center justify-between">
-                                  <div className="text-sm font-semibold">{s.label}</div>
-                                  {typeof s.score === "number" && (
-                                    <div className="text-xs text-zinc-400">
-                                      score {s.score.toFixed(3)}
+                            {m.sources.map((s) => {
+                              const isWeb = !!s.url;
+
+                              return (
+                                <div key={s.label} className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 p-3">
+                                  <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                                    {s.label} {isWeb ? "· Web" : "· Local"}
+                                  </div>
+
+                                  {isWeb ? (
+                                    <div className="mt-1">
+                                      <a
+                                        href={s.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="text-sm font-medium text-cyan-600 dark:text-cyan-400 hover:underline"
+                                      >
+                                        {s.title || s.url}
+                                      </a>
+                                      {s.snippet ? (
+                                        <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                          {s.snippet}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  ) : (
+                                    <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                      <div className="truncate">{s.doc_path}</div>
+                                      <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                                        chunk {s.chunk_index} {typeof s.score === "number" ? `· score ${s.score.toFixed(3)}` : ""}
+                                      </div>
                                     </div>
                                   )}
                                 </div>
-                                <div className="mt-1 text-xs text-zinc-300 break-all">
-                                  {s.doc_path}
-                                </div>
-                                <div className="mt-1 text-xs text-zinc-400">
-                                  chunk {s.chunk_index}
-                                </div>
-                              </div>
-                            ))}
+                              );
+                            })}
+
                           </div>
                         </details>
                       </div>
                     )}
                   </div>
                 </motion.div>
-              ))}
+                );
+              })}
             </AnimatePresence>
           </div>
         </div>
@@ -826,6 +898,9 @@ export default function Page() {
                   </option>
                   <option className="bg-[#0f1620] text-slate-100" value="general">
                     General
+                  </option>
+                  <option className="bg-[#0f1620] text-slate-100" value="search">
+                    Search
                   </option>
                 </select>
                 <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-cyan-200">
