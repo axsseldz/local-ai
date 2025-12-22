@@ -111,7 +111,6 @@ export default function Page() {
   const [uploading, setUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState("");
-  const [ttsEnabled, setTtsEnabled] = useState(true);
 
   const spokenRef = useRef<string>(""); // avoid double-speaking
   const finalTranscriptRef = useRef<string>("");
@@ -120,7 +119,11 @@ export default function Page() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const spokenSentencesRef = useRef<Set<string>>(new Set());
+  const ttsRemainderRef = useRef<string>(""); // keeps leftover across chunks
 
+  // --- TTS ---
+  const [ttsMuted, setTtsMuted] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState(""); // texto parcial live
 
 
@@ -130,6 +133,37 @@ export default function Page() {
     });
     return () => cancelAnimationFrame(id);
   }, [messages]);
+
+  const jarvisVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("speechSynthesis" in window)) return;
+
+    const pickJarvis = () => {
+      const voices = window.speechSynthesis.getVoices() || [];
+      // Force this exact voice if available
+      const exact = voices.find(v => v.name === "Google UK English Male" && v.lang === "en-GB");
+
+      // Fallbacks if it’s not available on this machine/browser
+      const fallback =
+        exact ||
+        voices.find(v => v.name.includes("Google UK English Male")) ||
+        voices.find(v => v.lang === "en-GB") ||
+        voices.find(v => v.lang?.startsWith("en")) ||
+        voices[0] ||
+        null;
+
+      jarvisVoiceRef.current = fallback;
+    };
+
+    pickJarvis();
+    window.speechSynthesis.onvoiceschanged = pickJarvis;
+
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+    };
+  }, []);
 
   useEffect(() => {
     fetchIndexStatus();
@@ -161,34 +195,95 @@ export default function Page() {
     await askWithText(question);
   }
 
-  function speak(text: string) {
-    if (!ttsEnabled) return;
+  function stripForSpeech(input: string) {
+    let t = input || "";
+
+    // quita bloques de código
+    t = t.replace(/```[\s\S]*?```/g, " ");
+
+    // quita inline code
+    t = t.replace(/`([^`]+)`/g, "$1");
+
+    // quita markdown links [text](url) -> text
+    t = t.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+
+    // quita citas tipo [S1], [S2]
+    t = t.replace(/\[S\d+\]/g, "");
+
+    // colapsa espacios
+    t = t.replace(/\s+/g, " ").trim();
+
+    // evita leer “Thinking…”
+    if (/^thinking/i.test(t)) return "";
+
+    return t;
+  }
+
+  function normalizeSentenceForDedupe(s: string) {
+    return stripForSpeech(s)
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/\s+([.!?,])/g, "$1")
+      .trim();
+  }
+
+  function pickMaleEnglishVoice(voices: SpeechSynthesisVoice[], preferredName?: string) {
+    if (!voices?.length) return null;
+
+    if (preferredName) {
+      const exact = voices.find(v => v.name === preferredName);
+      if (exact) return exact;
+    }
+
+    const en = voices.filter(v => v.lang?.startsWith("en"));
+
+    // Prioridad Mac “masculina” (común)
+    return (
+      en.find(v => /Alex/i.test(v.name)) ||
+      en.find(v => /Daniel/i.test(v.name)) ||
+      en.find(v => /Tom/i.test(v.name)) ||
+      en.find(v => /Fred/i.test(v.name)) ||
+      // fallback: evita Samantha/Victoria si puedes
+      en.find(v => !/Samantha|Victoria|Karen|Moira|Tessa/i.test(v.name)) ||
+      en[0] ||
+      voices[0] ||
+      null
+    );
+  }
+
+  function speakText(rawText: string, opts?: { interrupt?: boolean }) {
+    if (typeof window === "undefined") return;
+    if (ttsMuted) return;
     if (!("speechSynthesis" in window)) return;
 
-    // Prevent re-speaking same message
+    const text = stripForSpeech(rawText);
+    if (!text) return;
+
+    // Avoid re-speaking identical sentence
     if (spokenRef.current === text) return;
     spokenRef.current = text;
 
-    window.speechSynthesis.cancel(); // stop previous speech
+    const interrupt = opts?.interrupt ?? false;
 
-    const utterance = new SpeechSynthesisUtterance(text);
+    try {
+      if (interrupt) window.speechSynthesis.cancel();
 
-    // Optional tuning (Mac voices sound great)
-    utterance.rate = 1.0;
-    utterance.pitch = 1.0;
-    utterance.volume = 1.0;
+      const utterance = new SpeechSynthesisUtterance(text);
 
-    // Prefer a natural English voice
-    const voices = window.speechSynthesis.getVoices();
-    const preferred =
-      voices.find(v => v.name.includes("Samantha")) ||
-      voices.find(v => v.lang.startsWith("en")) ||
-      voices[0];
+      // Jarvis-ish tuning (slightly slower + deeper)
+      utterance.rate = 0.98;
+      utterance.pitch = 0.85;
+      utterance.volume = 1.0;
 
-    if (preferred) utterance.voice = preferred;
+      const v = jarvisVoiceRef.current;
+      if (v) utterance.voice = v;
 
-    window.speechSynthesis.speak(utterance);
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      // ignore
+    }
   }
+
 
   async function fetchDocs() {
     try {
@@ -317,12 +412,13 @@ export default function Page() {
       setMicError("Microphone permission denied or not available.");
     }
   }
-  const textToSend = (finalTranscriptRef.current || question).trim();
-  finalTranscriptRef.current = ""; // reset for next recording
 
   function stopRecording() {
     if (!isRecording) return;
     setIsRecording(false);
+
+    const textToSend = (finalTranscriptRef.current || question).trim();
+    finalTranscriptRef.current = ""; // reset for next recording
 
     // stop audio graph
     processorRef.current?.disconnect();
@@ -382,6 +478,8 @@ export default function Page() {
     };
 
     spokenRef.current = ""; // allow speaking for this new answer
+    spokenSentencesRef.current = new Set();
+    ttsRemainderRef.current = "";
     setMessages((prev) => [...prev, userMsg, pendingAssistant]);
     setQuestion("");
 
@@ -402,7 +500,7 @@ export default function Page() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let assistantText = ""; // ✅ accumulate streamed answer for TTS
-
+      let ttsBuffer = ""; // keeps partial text until a sentence is complete
       let buffer = "";
       let metaApplied = false;
 
@@ -443,11 +541,15 @@ export default function Page() {
           }
 
           if (eventName === "done") {
-            const finalText = assistantText.trim();
-            if (finalText) {
-              speak(finalText); // 🔊 THIS WILL NOW WORK
+            const tail = (ttsRemainderRef.current || "").trim();
+            if (tail) {
+              const key = normalizeSentenceForDedupe(tail);
+              if (key && !spokenSentencesRef.current.has(key)) {
+                spokenSentencesRef.current.add(key);
+                speakText(tail, { interrupt: false });
+              }
             }
-            continue;
+            ttsRemainderRef.current = "";
           };
 
           const chunk = data;
@@ -455,6 +557,40 @@ export default function Page() {
 
           // accumulate locally for TTS
           assistantText += chunk;
+
+          // --- sentence-level TTS (safe, no repeats) ---
+          ttsRemainderRef.current += chunk;
+
+          // Consume complete sentences from the FRONT of the remainder.
+          // This avoids regex lastIndex bugs and prevents re-speaking the same sentence.
+          while (true) {
+            const r = ttsRemainderRef.current;
+
+            // find first sentence end
+            const idx = r.search(/[.!?]/);
+            if (idx === -1) break;
+
+            // include consecutive punctuation like "..." or "?!"
+            let end = idx + 1;
+            while (end < r.length && /[.!?]/.test(r[end])) end++;
+
+            // Only speak if we have at least a space or end after punctuation (helps reduce mid-word cuts)
+            // If next char exists and isn't whitespace, wait for more text.
+            if (end < r.length && !/\s/.test(r[end])) break;
+
+            const sentence = r.slice(0, end).trim();
+            ttsRemainderRef.current = r.slice(end).trimStart();
+
+            if (sentence.length >= 3) {
+              const key = normalizeSentenceForDedupe(sentence);
+              if (key && !spokenSentencesRef.current.has(key)) {
+                spokenSentencesRef.current.add(key);
+                speakText(sentence, { interrupt: false }); // queue
+              }
+            }
+          }
+
+
 
           // update UI
           setMessages((prev) =>
@@ -785,6 +921,26 @@ export default function Page() {
                 >
                   Clear
                 </button>
+                {/* TTS controls */}
+                <button
+                  onClick={() => {
+                    setTtsMuted((m) => {
+                      const next = !m;
+                      // Always stop current speech when toggling mute
+                      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      // Reset so the next content can be spoken again
+                      spokenRef.current = "";
+                      return next;
+                    });
+                  }}
+                  className={cx(controlButtonBase, controlButtonActive)}
+                  title={ttsMuted ? "Unmute voice" : "Mute voice"}
+                >
+                  {ttsMuted ? "Unmute 🔊" : "Mute 🔇"}
+                </button>
+
               </div>
 
             </div>
@@ -810,17 +966,6 @@ export default function Page() {
                 title={isRecording ? "Stop recording" : "Start recording"}
               >
                 {isRecording ? "■" : "🎤"}
-              </button>
-
-              <button
-                onClick={() => {
-                  setTtsEnabled(v => !v);
-                  window.speechSynthesis.cancel(); // stop if muting mid-speech
-                }}
-                className="rounded-xl px-3 py-1.5 text-sm border border-zinc-300 dark:border-zinc-700
-             bg-white dark:bg-zinc-900 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition"
-              >
-                {ttsEnabled ? "🔊 Voice On" : "🔇 Muted"}
               </button>
 
               <button

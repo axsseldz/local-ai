@@ -11,3 +11,4 @@ frontend/.next/
 frontend/.env*
 
 .DS_Store
+.env
