@@ -10,7 +10,6 @@ from db import get_chunks_by_vector_ids
 from pathlib import Path
 from datetime import datetime, timezone
 from index import run_index  
-from typing import Any
 from vosk import Model, KaldiRecognizer
 from dotenv import load_dotenv
 import httpx
@@ -18,9 +17,10 @@ import faiss
 import json
 import asyncio
 import os
-import re
 import tempfile
 import subprocess
+import time
+import re
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5-coder:14b"
@@ -46,6 +46,108 @@ INDEX_STATUS = {
     "last_error": None,
     "stats": None,
 }
+
+LLM_METRICS = {
+    "tokens_per_second": None,
+    "ttft_ms": None,
+    "context_chars": None,
+    "last_updated": None,
+}
+
+_METAL_CACHE = {"value": None, "ts": 0.0}
+
+def _run_cmd(cmd: list[str], timeout: float = 1.5) -> str | None:
+    try:
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        ).stdout
+    except Exception:
+        return None
+
+def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
+    if not out:
+        return None, None
+    page_size = 4096
+    first_line = out.splitlines()[0] if out else ""
+    m = re.search(r"page size of (\d+) bytes", first_line)
+    if m:
+        page_size = int(m.group(1))
+
+    def grab(key: str) -> int:
+        m2 = re.search(rf"{key}:\s+([\d]+)\.", out)
+        return int(m2.group(1)) if m2 else 0
+
+    free = grab("Pages free") + grab("Pages speculative")
+    total = sum(
+        grab(k)
+        for k in [
+            "Pages active",
+            "Pages inactive",
+            "Pages speculative",
+            "Pages throttled",
+            "Pages wired down",
+            "Pages purgeable",
+            "Pages occupied by compressor",
+            "Pages free",
+        ]
+    )
+    if total == 0:
+        return None, None
+    free_bytes = free * page_size
+    used_bytes = (total * page_size) - free_bytes
+    return used_bytes, total * page_size
+
+def _parse_swap(out: str) -> tuple[int | None, int | None]:
+    if not out:
+        return None, None
+    m_total = re.search(r"total = ([\d.]+)([KMG])", out)
+    m_used = re.search(r"used = ([\d.]+)([KMG])", out)
+    if not m_total or not m_used:
+        return None, None
+
+    def to_bytes(val: float, unit: str) -> int:
+        mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1)
+        return int(val * mult)
+
+    total = to_bytes(float(m_total.group(1)), m_total.group(2))
+    used = to_bytes(float(m_used.group(1)), m_used.group(2))
+    return used, total
+
+def _get_cpu_percent() -> float | None:
+    out = _run_cmd(["ps", "-A", "-o", "%cpu="], timeout=1.0)
+    if not out:
+        return None
+    vals = []
+    for line in out.splitlines():
+        try:
+            vals.append(float(line.strip()))
+        except Exception:
+            continue
+    if not vals:
+        return None
+    ncpu_out = _run_cmd(["sysctl", "-n", "hw.ncpu"], timeout=1.0) or "1"
+    try:
+        ncpu = max(1, int(ncpu_out.strip()))
+    except Exception:
+        ncpu = 1
+    total = sum(vals)
+    return min(100.0, total / ncpu)
+
+def _get_metal_status() -> bool | None:
+    now = time.time()
+    if _METAL_CACHE["value"] is not None and now - _METAL_CACHE["ts"] < 60:
+        return _METAL_CACHE["value"]
+    out = _run_cmd(["system_profiler", "SPDisplaysDataType"], timeout=2.0)
+    if not out:
+        return None
+    supported = "Metal: Supported" in out or "Metal Family" in out
+    _METAL_CACHE["value"] = supported
+    _METAL_CACHE["ts"] = now
+    return supported
 
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -206,7 +308,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    mode: str = "auto"  # auto | local | general | search
+    mode: str = "local"  # local | general | search
     model: str | None = None
     top_k: int = 6
     task: str | None = None     # qa | summary | None (auto-infer)
@@ -214,75 +316,6 @@ class AskRequest(BaseModel):
 class RememberRequest(BaseModel):
     content: str
     source: str = "manual"
-
-def _normalize_q(q: str) -> str:
-    return (q or "").strip().lower()
-
-def looks_like_doc_question(q: str) -> bool:
-    """
-    Strong hints user wants *their* local docs.
-    """
-    q = _normalize_q(q)
-    doc_markers = [
-        "my ", "mine", "resume", "cv", "kardex", "transcript", "document",
-        "pdf", "file", "in this", "in the doc", "according to", "based on the document",
-        "from my", "from the pdf", "from the file", "what does it say"
-    ]
-    return any(m in q for m in doc_markers)
-
-def looks_like_general_question(q: str) -> bool:
-    """
-    Strong hints user wants general knowledge (even if local retrieval returns something vaguely similar).
-    """
-    q = _normalize_q(q)
-    general_markers = [
-        "what is", "who is", "explain", "how does", "define", "difference between",
-        "history of", "when did", "why does", "examples of", "best way to",
-    ]
-    # If it also looks like a doc question, don't force general.
-    return any(m in q for m in general_markers) and not looks_like_doc_question(q)
-
-def clamp(s: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    try:
-        return max(lo, min(hi, float(s)))
-    except Exception:
-        return lo
-
-async def llm_relevance_gate(question: str, sources: list[dict], model: str) -> tuple[bool, str]:
-    """
-    Optional small LLM 'judge' to prevent false positives:
-    - returns (use_local, reason)
-    Keep this tiny + deterministic.
-    """
-    # Take only a couple short snippets to keep it fast.
-    def snip(t: str, n: int = 420) -> str:
-        t = (t or "").strip()
-        return t[:n] + ("…" if len(t) > n else "")
-
-    blocks = []
-    for s in sources[:2]:
-        blocks.append(f"{s.get('label','S?')} ({s.get('doc_path','?')}):\n{snip(s.get('text_preview',''))}")
-
-    prompt = (
-        "You are a routing classifier for a local-docs assistant.\n"
-        "Decide if the QUESTION can be answered using ONLY the provided SOURCES.\n"
-        "If SOURCES are unrelated, say use_local=false.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "SOURCES:\n" + ("\n\n".join(blocks) if blocks else "(none)") + "\n\n"
-        "Respond ONLY as strict JSON: {\"use_local\": true/false, \"reason\": \"...\"}\n"
-    )
-
-    try:
-        raw = await ollama_generate(prompt, model)
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        if not m:
-            return False, "gate:no-json"
-        data = json.loads(m.group(0))
-        use_local = bool(data.get("use_local", False))
-        reason = str(data.get("reason", "")).strip()[:180]
-        return use_local, f"gate:{reason or 'ok'}"
-    except Exception:
-        return False, "gate:error"
 
 def infer_task(question: str) -> str:
     q = question.lower()
@@ -422,89 +455,39 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         "n_sources": len(sources),
     }
 
-async def route_auto(question: str, task: str, top_k: int, model: str) -> dict[str, Any]:
-    """
-    Returns:
-      {
-        "final_mode": "auto->local"|"auto->general",
-        "prompt": <string>,
-        "sources": <list>,
-        "retrieval": <dict>,
-        "routing_reason": <string>
-      }
-    """
-    prompt_local, sources_local, retrieval_local = await build_local_prompt_and_sources(question, task, top_k)
-
-    best = clamp(retrieval_local.get("best_score", 0.0))
-    avg3 = clamp(retrieval_local.get("avg_top3", 0.0))
-    gap = clamp(retrieval_local.get("score_gap", 0.0), 0.0, 10.0)
-    nsrc = int(retrieval_local.get("n_sources", 0) or 0)
-
-    # Hard fallback if nothing retrieved
-    if prompt_local is None or nsrc == 0:
-        return {
-            "final_mode": "auto->general",
-            "prompt": question,
-            "sources": [],
-            "retrieval": {},
-            "routing_reason": "no-local-context",
-        }
-
-    # Thresholds (tune over time)
-    # - low confidence => general
-    if best < 0.38 or avg3 < 0.34:
-        return {
-            "final_mode": "auto->general",
-            "prompt": question,
-            "sources": [],
-            "retrieval": {},
-            "routing_reason": f"low-retrieval(best={best:.2f},avg3={avg3:.2f})",
-        }
-
-    # - very high confidence => local
-    if best >= 0.62:
-        return {
-            "final_mode": "auto->local",
-            "prompt": prompt_local,
-            "sources": sources_local,
-            "retrieval": retrieval_local,
-            "routing_reason": f"high-retrieval(best={best:.2f})",
-        }
-
-    # Middle zone: use heuristics + optional LLM gate to avoid false positives
-    if looks_like_doc_question(question):
-        return {
-            "final_mode": "auto->local",
-            "prompt": prompt_local,
-            "sources": sources_local,
-            "retrieval": retrieval_local,
-            "routing_reason": f"doc-intent(best={best:.2f})",
-        }
-
-    if looks_like_general_question(question) and gap < 0.10:
-        # If it looks general and retrieval isn't sharply confident, run a small gate
-        use_local, reason = await llm_relevance_gate(question, sources_local, model)
-        if not use_local:
-            return {
-                "final_mode": "auto->general",
-                "prompt": question,
-                "sources": [],
-                "retrieval": {},
-                "routing_reason": reason,
-            }
-
-    # Default: local
-    return {
-        "final_mode": "auto->local",
-        "prompt": prompt_local,
-        "sources": sources_local,
-        "retrieval": retrieval_local,
-        "routing_reason": f"mid-retrieval(best={best:.2f},gap={gap:.2f})",
-    }
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/api/metrics")
+def metrics():
+    used_bytes, total_bytes = _parse_vm_stat(_run_cmd(["vm_stat"]))
+    swap_used, swap_total = _parse_swap(_run_cmd(["sysctl", "vm.swapusage"]))
+    cpu_percent = _get_cpu_percent()
+    metal_supported = _get_metal_status()
+
+    return {
+        "system": {
+            "memory_used_bytes": used_bytes,
+            "memory_total_bytes": total_bytes,
+            "swap_used_bytes": swap_used,
+            "swap_total_bytes": swap_total,
+            "cpu_percent": cpu_percent,
+            "gpu_util_percent": None,
+            "metal_supported": metal_supported,
+        },
+        "llm": {
+            "tokens_per_second": LLM_METRICS["tokens_per_second"],
+            "ttft_ms": LLM_METRICS["ttft_ms"],
+            "context_chars": LLM_METRICS["context_chars"],
+            "last_updated": LLM_METRICS["last_updated"],
+        },
+        "model": {
+            "name": DEFAULT_MODEL,
+            "quantization": None,
+            "backend": "Ollama",
+        },
+    }
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):
@@ -760,7 +743,7 @@ async def ask(req: AskRequest):
         }
 
     # ---------- ROUTING ----------
-    mode = (req.mode or "auto").lower().strip()
+    mode = (req.mode or "local").lower().strip()
 
     if mode == "general":
         return await run_general()
@@ -796,49 +779,19 @@ async def ask(req: AskRequest):
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"Brave Search error: {str(e)}")
 
-    if mode == "auto":
-        routed = await route_auto(req.question, task, req.top_k, model)
-
-        if routed["final_mode"] == "auto->general":
-            result = await run_general()
-            result["mode"] = "auto->general"
-            result["routing_reason"] = routed["routing_reason"]
-            return result
-
-        # local
-        try:
-            answer = await ollama_generate(routed["prompt"], model)
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
-
-        return {
-            "answer": answer,
-            "mode": "auto->local",
-            "task": task,
-            "sources": routed["sources"],
-            "used_tools": ["ollama", "faiss", "sqlite"],
-            "model": model,
-            "retrieval": routed["retrieval"],
-            "routing_reason": routed["routing_reason"],
-        }
-
-    raise HTTPException(status_code=400, detail="Unsupported mode. Use 'auto', 'local', or 'general'.")
+    raise HTTPException(status_code=400, detail="Unsupported mode. Use 'local', 'general', or 'search'.")
 
 @app.post("/ask/stream")
 async def ask_stream(req: AskRequest):
     model = req.model or DEFAULT_MODEL
     task = req.task or infer_task(req.question)
-    mode = (req.mode or "auto").lower().strip()
+    mode = (req.mode or "local").lower().strip()
 
     async def sse():
         # Decide route + build prompt (without generating yet)
         final_mode = mode
         sources = []
         retrieval = {}
-        routing_reason = None
-
         if mode == "general":
             prompt = (
                 "You are a helpful assistant.\n"
@@ -878,18 +831,10 @@ async def ask_stream(req: AskRequest):
                 yield "event: done\ndata: {}\n\n"
                 return
 
-        elif mode == "auto":
-            routed = await route_auto(req.question, task, req.top_k, model)
-            final_mode = routed["final_mode"]
-            prompt = routed["prompt"]
-            sources = routed["sources"]
-            retrieval = routed["retrieval"]
-            routing_reason = routed["routing_reason"]
-
         else:
             meta = {"mode": "error", "task": task, "sources": [], "model": model}
             yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
-            yield f"data: Unsupported mode. Use 'auto', 'local', or 'general'.\n\n"
+            yield f"data: Unsupported mode. Use 'local', 'general', or 'search'.\n\n"
             yield "event: done\ndata: {}\n\n"
             return
 
@@ -900,19 +845,32 @@ async def ask_stream(req: AskRequest):
             "sources": sources,
             "model": model,
             "retrieval": retrieval,
-            "routing_reason": routing_reason if mode == "auto" else None,
         }
         yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
         # Stream tokens
+        start_time = time.time()
+        first_chunk_time = None
+        token_count = 0
+        LLM_METRICS["context_chars"] = len(prompt or "")
+        LLM_METRICS["last_updated"] = time.time()
         try:
             async for chunk in ollama_stream(prompt, model):
+                if first_chunk_time is None and chunk.strip():
+                    first_chunk_time = time.time()
+                token_count += len(chunk.split())
                 # SSE message
                 yield f"data: {chunk}\n\n"
         except httpx.ConnectError:
             yield f"data: Cannot connect to Ollama. Is `ollama serve` running?\n\n"
         except Exception as e:
             yield f"data: Error: {str(e)}\n\n"
+        finally:
+            if first_chunk_time:
+                elapsed = max(0.001, time.time() - first_chunk_time)
+                LLM_METRICS["ttft_ms"] = round((first_chunk_time - start_time) * 1000)
+                LLM_METRICS["tokens_per_second"] = round(token_count / elapsed, 2)
+                LLM_METRICS["last_updated"] = time.time()
 
         yield "event: done\ndata: {}\n\n"
 

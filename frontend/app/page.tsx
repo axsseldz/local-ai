@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
 
-type Mode = "auto" | "local" | "general" | "search";
+type Mode = "local" | "general" | "search";
 
 type Source = {
   label: string;
@@ -28,7 +28,6 @@ type AskResponse = {
   sources?: Source[];
   used_tools?: string[];
   model?: string;
-  routing_reason?: string;
 };
 
 type ChatMessage = {
@@ -41,7 +40,7 @@ type ChatMessage = {
   model?: string;
   sources?: Source[];
   error?: boolean;
-  routing_reason?: string;
+  isLoading?: boolean;
 };
 
 type IndexStatus = {
@@ -65,6 +64,29 @@ type DocItem = {
   path: string;
   size: number;
   modified_at: string;
+};
+
+type MetricsResponse = {
+  system?: {
+    memory_used_bytes?: number | null;
+    memory_total_bytes?: number | null;
+    swap_used_bytes?: number | null;
+    swap_total_bytes?: number | null;
+    cpu_percent?: number | null;
+    gpu_util_percent?: number | null;
+    metal_supported?: boolean | null;
+  };
+  llm?: {
+    tokens_per_second?: number | null;
+    ttft_ms?: number | null;
+    context_chars?: number | null;
+    last_updated?: number | null;
+  };
+  model?: {
+    name?: string | null;
+    quantization?: string | null;
+    backend?: string | null;
+  };
 };
 
 function formatAssistantContent(message: ChatMessage) {
@@ -152,7 +174,7 @@ function downsampleBuffer(buffer: Float32Array, sampleRate: number, outRate = 16
 
 export default function Page() {
   const [question, setQuestion] = useState("");
-  const [mode, setMode] = useState<Mode>("auto");
+  const [mode, setMode] = useState<Mode>("general");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -163,10 +185,15 @@ export default function Page() {
   const [uploading, setUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState("");
+  const [showModeMenu, setShowModeMenu] = useState(false);
+  const [showDocsMenu, setShowDocsMenu] = useState(false);
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
 
   const spokenRef = useRef<string>(""); // avoid double-speaking
   const finalTranscriptRef = useRef<string>("");
   const chatRef = useRef<HTMLDivElement | null>(null);
+  const modeMenuRef = useRef<HTMLDivElement | null>(null);
+  const docsMenuRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -175,7 +202,7 @@ export default function Page() {
   const ttsRemainderRef = useRef<string>(""); // keeps leftover across chunks
 
   // --- TTS ---
-  const [ttsMuted, setTtsMuted] = useState(false);
+  const [ttsMuted, setTtsMuted] = useState(true);
   const [liveTranscript, setLiveTranscript] = useState(""); // texto parcial live
 
 
@@ -185,6 +212,19 @@ export default function Page() {
     });
     return () => cancelAnimationFrame(id);
   }, [messages]);
+
+  useEffect(() => {
+    if (!showModeMenu && !showDocsMenu) return;
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      const hitMode = modeMenuRef.current?.contains(target);
+      const hitDocs = docsMenuRef.current?.contains(target);
+      if (!hitMode) setShowModeMenu(false);
+      if (!hitDocs) setShowDocsMenu(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [showModeMenu, showDocsMenu]);
 
   const jarvisVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
 
@@ -265,8 +305,8 @@ export default function Page() {
     // colapsa espacios
     t = t.replace(/\s+/g, " ").trim();
 
-    // evita leer “Thinking…”
-    if (/^thinking/i.test(t)) return "";
+    // evita leer el loader
+    if (/^loading/i.test(t)) return "";
 
     return t;
   }
@@ -301,6 +341,18 @@ export default function Page() {
       voices[0] ||
       null
     );
+  }
+
+  function formatBytes(bytes?: number | null) {
+    if (bytes == null || Number.isNaN(bytes)) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let v = bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
   }
 
   function speakText(rawText: string, opts?: { interrupt?: boolean }) {
@@ -525,8 +577,9 @@ export default function Page() {
     const pendingAssistant: ChatMessage = {
       id: assistantId,
       role: "assistant",
-      content: "Thinking…",
+      content: "",
       createdAt: Date.now(),
+      isLoading: true,
     };
 
     spokenRef.current = ""; // allow speaking for this new answer
@@ -547,7 +600,9 @@ export default function Page() {
 
       if (!res.ok || !res.body) throw new Error(`Streaming failed: ${res.status}`);
 
-      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, content: "" } : m)));
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, content: "", isLoading: true } : m))
+      );
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
@@ -602,6 +657,9 @@ export default function Page() {
               }
             }
             ttsRemainderRef.current = "";
+            setMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, isLoading: false } : m))
+            );
           };
 
           const chunk = data;
@@ -648,7 +706,7 @@ export default function Page() {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: (m.content || "") + chunk }
+                ? { ...m, content: (m.content || "") + chunk, isLoading: false }
                 : m
             )
           );
@@ -657,7 +715,11 @@ export default function Page() {
     } catch {
       const msg = "Could not reach backend. Is FastAPI running on http://localhost:8000 ?";
       setError(msg);
-      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, content: msg, error: true } : m)));
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId ? { ...m, content: msg, error: true, isLoading: false } : m
+        )
+      );
     } finally {
       setLoading(false);
     }
@@ -688,11 +750,67 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexStatus?.last_finished_at]);
 
+  useEffect(() => {
+    let alive = true;
+    const fetchMetrics = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/api/metrics");
+        if (!res.ok) return;
+        const data = (await res.json()) as MetricsResponse;
+        if (alive) setMetrics(data);
+      } catch {
+        if (alive) setMetrics(null);
+      }
+    };
+
+    fetchMetrics();
+    const id = setInterval(fetchMetrics, 1500);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
   const controlButtonBase =
     "relative overflow-hidden rounded-xl border px-3 py-1.5 text-xs font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-[1px]";
   const controlButtonActive =
     "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)] active:scale-[0.98] active:border-cyan-300/70 active:bg-cyan-500/15 cursor-pointer";
   const controlButtonDisabled = "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed shadow-none";
+  const copyButtonClass =
+    "group inline-flex items-center gap-1.5 rounded-xl border border-slate-800/70 bg-slate-950/50 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-cyan-400/50 hover:bg-cyan-500/10 hover:text-cyan-100 active:translate-y-[1px] active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/40";
+  const modeLabels: Record<Mode, string> = {
+    local: "Local",
+    general: "General",
+    search: "Search",
+  };
+  const indexStats = indexStatus?.stats;
+  const indexProgress =
+    indexStats && indexStats.files_on_disk > 0
+      ? Math.min(
+        100,
+        Math.round(
+          ((indexStats.indexed_files + indexStats.skipped_files + indexStats.deleted_files) /
+            indexStats.files_on_disk) *
+          100
+        )
+      )
+      : null;
+  const docsButtonLabel = "Documents";
+  const memUsed = metrics?.system?.memory_used_bytes ?? null;
+  const memTotal = metrics?.system?.memory_total_bytes ?? null;
+  const memRatio = memUsed && memTotal ? memUsed / memTotal : null;
+  const memPressure =
+    memRatio == null ? "unknown" : memRatio < 0.75 ? "green" : memRatio < 0.9 ? "yellow" : "red";
+  const swapUsed = metrics?.system?.swap_used_bytes ?? null;
+  const cpuPercent = metrics?.system?.cpu_percent ?? null;
+  const gpuUtil = metrics?.system?.gpu_util_percent ?? null;
+  const metalSupported = metrics?.system?.metal_supported ?? null;
+  const tps = metrics?.llm?.tokens_per_second ?? null;
+  const ttft = metrics?.llm?.ttft_ms ?? null;
+  const contextChars = metrics?.llm?.context_chars ?? null;
+  const modelName = metrics?.model?.name ?? null;
+  const modelQuant = metrics?.model?.quantization ?? null;
+  const modelBackend = metrics?.model?.backend ?? null;
 
   return (
     <div
@@ -720,11 +838,273 @@ export default function Page() {
           >
             Jarvis
           </motion.div>
-          <p className="text-xs text-slate-400">Local + general AI</p>
+          <p className="text-xs text-slate-400">Local + General + Search</p>
         </div>
       </div>
 
-      <div className="relative mx-auto max-w-5xl px-4 pt-2 pb-4 flex-1 flex flex-col gap-3 min-h-0">
+      <div className="absolute top-4 right-4 z-20">
+        <div className="inline-flex flex-col items-stretch gap-2">
+          <div className="inline-flex items-center gap-2 rounded-2xl border border-slate-800/60 bg-slate-950/40 px-2.5 py-1.5 text-[11px] text-slate-300 shadow-sm">
+            {/* Docs dropdown */}
+            <div className="relative" ref={docsMenuRef}>
+              <button
+                type="button"
+                onClick={() => setShowDocsMenu((v) => !v)}
+                className={cx(
+                  "inline-flex items-center gap-2 rounded-lg border bg-slate-950/30 px-2 py-1 text-[11px] font-semibold text-slate-200 transition",
+                  showDocsMenu
+                    ? "border-cyan-400/60 bg-cyan-500/10 text-cyan-100"
+                    : "border-slate-800/70 hover:border-cyan-400/50 hover:text-cyan-100"
+                )}
+                title="Documents in data/documents"
+              >
+                <span className="max-w-[120px] truncate">{docsButtonLabel}</span>
+                <svg
+                  className={cx("h-3 w-3 text-cyan-200 transition-transform", showDocsMenu && "rotate-180")}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </button>
+
+              {showDocsMenu && (
+                <div className="absolute right-0 top-full mt-2 w-56 overflow-hidden rounded-xl border border-slate-800/70 bg-[#0e141c] shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+                  <div className="px-3 py-2 text-[11px] uppercase tracking-[0.35em] text-slate-400">
+                    Files
+                  </div>
+                  <div className="max-h-56 overflow-y-auto hide-scrollbar">
+                    {docs.length === 0 ? (
+                      <div className="w-full px-3 py-2 text-left text-xs text-slate-400">
+                        No docs
+                      </div>
+                    ) : (
+                      docs.map((d) => (
+                        <div
+                          key={d.name}
+                          className="flex w-full items-center justify-between px-3 py-2 text-xs font-semibold text-slate-200"
+                        >
+                          <span className="truncate">{d.name}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Upload (file picker) */}
+            <label
+              className="rounded-lg border border-slate-800/70 bg-slate-950/30 px-2 py-1 text-[11px] font-semibold text-slate-200 transition hover:border-cyan-400/50 hover:text-cyan-100"
+              title="Upload a document into data/documents and auto-index"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <svg
+                  className="h-3.5 w-3.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 3v12" />
+                  <path d="M7 8l5-5 5 5" />
+                  <path d="M5 21h14" />
+                </svg>
+                <span>Upload</span>
+              </span>
+              <input
+                type="file"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) uploadDoc(f);
+                  e.currentTarget.value = "";
+                }}
+                disabled={uploading}
+              />
+            </label>
+
+            {/* Index now */}
+            <button
+              onClick={startIndexNow}
+              disabled={!!indexStatus?.is_indexing || indexStarting}
+              className={cx(
+                "rounded-lg border px-2 py-1 text-[11px] font-semibold transition",
+                indexStatus?.is_indexing || indexStarting
+                  ? "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed"
+                  : "border-slate-800/70 bg-slate-950/30 text-slate-200 hover:border-cyan-400/50 hover:text-cyan-100"
+              )}
+              title="Run indexing now"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <svg
+                  className="h-3.5 w-3.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 4v6h6" />
+                  <path d="M20 20v-6h-6" />
+                  <path d="M20 8a8 8 0 0 0-14-4" />
+                  <path d="M4 16a8 8 0 0 0 14 4" />
+                </svg>
+                <span>Index now</span>
+              </span>
+            </button>
+          </div>
+
+          <div className="w-full rounded-2xl border border-slate-800/70 bg-slate-950/40 px-3 py-2">
+            <div className="flex items-center justify-between gap-3 text-[11px] font-semibold text-slate-200">
+              <span>Index status</span>
+              <span
+                className={cx(
+                  "rounded-full px-2 py-0.5 text-[11px]",
+                  indexStatus?.state === "running" && "bg-cyan-500/15 text-cyan-200",
+                  indexStatus?.state === "ok" && "bg-emerald-500/15 text-emerald-200",
+                  indexStatus?.state === "error" && "bg-rose-500/15 text-rose-200",
+                  (!indexStatus || indexStatus?.state === "idle") && "bg-slate-700/30 text-slate-300"
+                )}
+              >
+                {indexStatus?.is_indexing ? "Indexing…" : `${indexStatus?.state ?? "idle"}`}
+              </span>
+            </div>
+
+            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-900/60">
+              {indexStatus?.is_indexing ? (
+                indexProgress !== null ? (
+                  <div
+                    className="h-full bg-linear-to-r from-cyan-500 via-cyan-300 to-emerald-400 transition-[width] duration-300 index-bar"
+                    style={{ width: `${indexProgress}%` }}
+                  />
+                ) : (
+                  <div className="h-full w-2/5 bg-linear-to-r from-cyan-500 via-cyan-300 to-emerald-400 index-bar-indeterminate" />
+                )
+              ) : (
+                <div className="h-full w-full bg-linear-to-r from-cyan-500/40 to-emerald-400/40" />
+              )}
+            </div>
+
+            <div className="mt-2 text-[10px] text-slate-400">
+              {indexStatus?.state === "error" && indexStatus?.last_error
+                ? indexStatus.last_error
+                : indexStats
+                  ? `files ${indexStats.files_on_disk} · indexed ${indexStats.indexed_files} · skipped ${indexStats.skipped_files} · deleted ${indexStats.deleted_files}`
+                  : "No index stats available yet."}
+            </div>
+          </div>
+
+          <div className="w-full rounded-2xl border border-slate-800/70 bg-slate-950/40 px-3 py-2">
+            <div className="flex items-center justify-between gap-3 text-[11px] font-semibold text-slate-200">
+              <span>LLM Resource Monitor</span>
+              <span className="rounded-full bg-slate-700/30 px-2 py-0.5 text-[10px] text-slate-300">
+                Live
+              </span>
+            </div>
+
+            <div className="mt-2 space-y-2 text-[11px] text-slate-300">
+              <div className="flex items-center justify-between">
+                <span>Memory</span>
+                <span className="text-slate-100">
+                  {formatBytes(memUsed)} / {formatBytes(memTotal)}
+                </span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-900/60">
+                <div
+                  className={cx(
+                    "h-full transition-[width]",
+                    memPressure === "green" && "bg-emerald-400/70",
+                    memPressure === "yellow" && "bg-amber-400/70",
+                    memPressure === "red" && "bg-rose-400/70",
+                    memPressure === "unknown" && "bg-slate-600/40"
+                  )}
+                  style={{ width: memRatio ? `${Math.round(memRatio * 100)}%` : "10%" }}
+                />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span>Swap</span>
+                <span className={swapUsed ? "text-rose-200" : "text-emerald-200"}>
+                  {swapUsed == null ? "—" : `${formatBytes(swapUsed)}${swapUsed ? " in use" : " ok"}`}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex items-center justify-between">
+                  <span>CPU</span>
+                  <span className="text-slate-100">
+                    {cpuPercent != null
+                      ? `${cpuPercent.toFixed(1)}%`
+                      : "—"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>GPU</span>
+                  <span className="text-slate-100">
+                    {gpuUtil != null
+                      ? `${gpuUtil.toFixed(0)}%`
+                      : "—"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Metal</span>
+                  <span
+                    className={cx(
+                      "text-slate-100",
+                      metalSupported === false && "text-rose-200",
+                      metalSupported === true && "text-emerald-200"
+                    )}
+                  >
+                    {metalSupported == null
+                      ? "Unknown"
+                      : metalSupported
+                        ? "Active"
+                        : "Off"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Context</span>
+                  <span className="text-slate-100">
+                    {contextChars != null ? `${contextChars}` : "—"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex items-center justify-between">
+                  <span>TPS</span>
+                  <span className="text-slate-100">
+                    {tps != null ? tps : "—"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>TTFT</span>
+                  <span className="text-slate-100">
+                    {ttft != null ? `${ttft} ms` : "—"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="pt-1 text-[10px] text-slate-400">
+                Model {modelName ?? "—"} · Quant {modelQuant ?? "—"} · {modelBackend ?? "—"}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="relative mx-auto w-[90vw] max-w-250 px-4 pt-2 pb-4 flex-1 flex flex-col gap-3 min-h-0">
         {/* error */}
         <AnimatePresence>
           {error && (
@@ -741,9 +1121,8 @@ export default function Page() {
 
         {/* chat history above prompt */}
         <div
-          className="mx-auto w-full max-w-5xl rounded-3xl border border-slate-800/60 bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a] p-4 mt-4 flex-1 min-h-80 min-w-0 overflow-y-auto scroll-smooth shadow-[0_18px_80px_rgba(0,0,0,0.35)] backdrop-blur-xl"
+          className="mx-auto w-full max-w-250 p-4 mt-4 flex-1 min-h-80 min-w-0 overflow-y-auto scroll-smooth hide-scrollbar"
           ref={chatRef}
-          style={{ scrollbarGutter: "stable" }}
           onDragOver={(e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -761,119 +1140,125 @@ export default function Page() {
               {messages.map((m) => {
                 // Format assistant replies to look polished and readable
                 const formatted = m.role === "assistant" ? formatAssistantContent(m) : m.content;
+                const canCopy = !m.error && !m.isLoading && !!m.content;
+                const copyText = m.role === "assistant" ? formatted || "" : m.content || "";
                 return (
-                <motion.div
-                  key={m.id}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  className={cx(
-                    "rounded-3xl border border-slate-800/60 backdrop-blur-xl shadow-[0_18px_80px_rgba(0,0,0,0.35)] overflow-hidden",
-                    m.role === "user"
-                      ? "ml-auto bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a]"
-                      : "mr-auto bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a]"
-                  )}
-                >
-                  <div className="p-4 flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={cx(
-                          "h-2.5 w-2.5 rounded-full shadow-[0_0_18px_rgba(56,189,248,0.35)]",
-                          m.role === "user"
-                            ? "bg-linear-to-r from-emerald-300 to-cyan-400"
-                            : "bg-linear-to-r from-slate-300 to-slate-500"
+                  <motion.div
+                    key={m.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className={cx(
+                      "rounded-3xl overflow-hidden",
+                      m.role === "user"
+                        ? "ml-auto bg-linear-to-r"
+                        : "mr-auto bg-linear-to-r"
+                    )}
+                  >
+                    <div className="p-4 flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={cx(
+                            "h-2.5 w-2.5 rounded-full",
+                            m.role === "user"
+                              ? "bg-linear-to-r from-emerald-300 to-cyan-400"
+                              : "bg-linear-to-r from-slate-300 to-slate-500"
+                          )}
+                        />
+                        <div className="font-semibold">
+                          {m.role === "user" ? "You" : "Jarvis"}
+                        </div>
+                        {m.role === "assistant" && (m.mode || m.task) && (
+                          <span className="text-xs text-slate-400">
+                            {m.mode ? m.mode : ""}
+                            {m.mode && m.task ? " • " : ""}
+                            {m.task ? m.task : ""}
+                          </span>
                         )}
-                      />
-                      <div className="font-semibold">
-                        {m.role === "user" ? "You" : "Jarvis"}
                       </div>
-                      {m.role === "assistant" && (m.mode || m.task) && (
-                        <span className="text-xs text-slate-400">
-                          {m.mode ? m.mode : ""}
-                          {m.mode && m.task ? " • " : ""}
-                          {m.task ? m.task : ""}
-                        </span>
-                      )}
+
                     </div>
 
-                    {m.role === "assistant" && !m.error && m.content && m.content !== "Thinking…" && (
-                      <button
-                        className="rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-950/70 transition"
-                        onClick={() => navigator.clipboard.writeText(formatted || "")}
-                        title="Copy answer"
-                      >
-                        Copy
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="px-5 pb-5">
-                    {m.role === "assistant" ? (
-                      <div className="prose prose-invert max-w-none leading-relaxed prose-p:my-3 prose-li:my-1">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>
-                      </div>
-                    ) : (
-                      <div className="whitespace-pre-wrap text-sm text-slate-100 leading-relaxed">
-                        {m.content}
-                      </div>
-                    )}
-
-                    {m.role === "assistant" && m.sources && m.sources.length > 0 && (
-                      <div className="mt-5">
-                        <details className="group">
-                          <summary className="cursor-pointer list-none flex items-center justify-between rounded-2xl border border-slate-800/60 bg-slate-950/50 px-4 py-3 hover:bg-slate-950/70 transition">
-                            <span className="text-sm font-semibold">
-                              Sources ({m.sources.length})
+                    <div className="px-5 pb-5">
+                      {m.role === "assistant" ? (
+                        m.isLoading ? (
+                          <div className="flex items-center gap-3 text-sm text-slate-300">
+                            <div className="loading-dots" aria-hidden="true">
+                              <span className="loading-dot" />
+                              <span className="loading-dot" />
+                              <span className="loading-dot" />
+                            </div>
+                            <span className="text-[11px] uppercase tracking-[0.3em] text-cyan-200/70">
+                              Loading
                             </span>
-                            <span className="text-xs text-zinc-400 group-open:rotate-180 transition-transform">
-                              ▾
-                            </span>
-                          </summary>
-
-                          <div className="mt-3 grid gap-2">
-                            {m.sources.map((s) => {
-                              const isWeb = !!s.url;
-
-                              return (
-                                <div key={s.label} className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 p-3">
-                                  <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-                                    {s.label} {isWeb ? "· Web" : "· Local"}
-                                  </div>
-
-                                  {isWeb ? (
-                                    <div className="mt-1">
-                                      <a
-                                        href={s.url}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        className="text-sm font-medium text-cyan-600 dark:text-cyan-400 hover:underline"
-                                      >
-                                        {s.title || s.url}
-                                      </a>
-                                      {s.snippet ? (
-                                        <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
-                                          {s.snippet}
-                                        </div>
-                                      ) : null}
-                                    </div>
-                                  ) : (
-                                    <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
-                                      <div className="truncate">{s.doc_path}</div>
-                                      <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                                        chunk {s.chunk_index} {typeof s.score === "number" ? `· score ${s.score.toFixed(3)}` : ""}
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-
                           </div>
-                        </details>
-                      </div>
-                    )}
-                  </div>
-                </motion.div>
+                        ) : (
+                          <div className="prose prose-invert max-w-none leading-relaxed prose-p:my-3 prose-li:my-1">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>
+                          </div>
+                        )
+                      ) : (
+                        <div className="whitespace-pre-wrap text-sm text-slate-100 leading-relaxed">
+                          {m.content}
+                        </div>
+                      )}
+
+                      {m.role === "assistant" && m.sources && m.sources.length > 0 && (
+                        <div className="mt-5">
+                          <details className="group">
+                            <summary className="cursor-pointer list-none flex items-center justify-between rounded-2xl border border-slate-800/60 bg-slate-950/50 px-4 py-3 hover:bg-slate-950/70 transition">
+                              <span className="text-sm font-semibold">
+                                Sources ({m.sources.length})
+                              </span>
+                              <span className="text-xs text-zinc-400 group-open:rotate-180 transition-transform">
+                                ▾
+                              </span>
+                            </summary>
+
+                            <div className="mt-3 grid gap-2">
+                              {m.sources.map((s) => {
+                                const isWeb = !!s.url;
+
+                                return (
+                                  <div key={s.label} className="rounded-xl border border-zinc-200/70 dark:border-zinc-800/70 p-3">
+                                    <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                                      {s.label} {isWeb ? "· Web" : "· Local"}
+                                    </div>
+
+                                    {isWeb ? (
+                                      <div className="mt-1">
+                                        <a
+                                          href={s.url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          className="text-sm font-medium text-cyan-600 dark:text-cyan-400 hover:underline"
+                                        >
+                                          {s.title || s.url}
+                                        </a>
+                                        {s.snippet ? (
+                                          <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                            {s.snippet}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    ) : (
+                                      <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                                        <div className="truncate">{s.doc_path}</div>
+                                        <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                                          chunk {s.chunk_index} {typeof s.score === "number" ? `· score ${s.score.toFixed(3)}` : ""}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+
+                            </div>
+                          </details>
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
                 );
               })}
             </AnimatePresence>
@@ -881,179 +1266,291 @@ export default function Page() {
         </div>
 
         {/* input at bottom */}
-        <div className="rounded-3xl h-35 border border-slate-800/60 bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a] backdrop-blur-xl shadow-[0_18px_80px_rgba(0,0,0,0.45)] mt-2 mb-1 mx-auto w-full max-w-5xl">
-          <div className="p-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="relative">
-                <select
-                  className="select-modern appearance-none rounded-xl border border-slate-800/70 bg-linear-to-r from-[#0f1823] via-[#0f1c28] to-[#0b1420] px-4 py-2 pr-9 text-sm font-medium text-slate-100 shadow-sm focus:outline-none focus:ring-0 focus:border-cyan-500/40 hover:border-cyan-400/50 transition"
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value as Mode)}
+        <div className="rounded-3xl h-29 border border-slate-800/60 bg-linear-to-r from-[#0f1823] via-[#0f1f2b] to-[#0b111a] backdrop-blur-xl shadow-[0_18px_80px_rgba(0,0,0,0.45)] mt-2 mb-8 mx-auto w-full max-w-450">
+          <div className="p-4">
+            <textarea
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={onKeyDown}
+              placeholder='Ask Jarvis something, or click the microphone to speak...'
+              className="w-full min-h-5 resize-none bg-transparent text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500"
+            />
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative" ref={modeMenuRef}>
+                  <button
+                    type="button"
+                    onClick={() => setShowModeMenu((v) => !v)}
+                    className={cx(
+                      "mt-1.5 h-8 w-8 rounded-2xl text-slate-200 transition hover:border-cyan-400/60 hover:bg-cyan-500/10 active:scale-[0.97] active:translate-y-px",
+                      showModeMenu ? "border-cyan-400/70 bg-cyan-500/10" : "border-slate-800/70"
+                    )}
+                    title="Choose mode"
+                  >
+                    <span className="sr-only">Choose mode</span>
+                    <svg
+                      className="mx-auto h-4.5 w-4.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 5v14" />
+                      <path d="M5 12h14" />
+                    </svg>
+                  </button>
+
+                  {showModeMenu && (
+                    <div className="absolute bottom-full left-0 mb-3 z-20 w-60 rounded-2xl border border-slate-800/70 bg-[#0e141c] shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+                      <div className="px-4 py-3 text-[11px] uppercase tracking-[0.35em] text-slate-400">
+                        Modes
+                      </div>
+                      {(["local", "general", "search"] as Mode[]).map((opt) => (
+                        <button
+                          key={opt}
+                          type="button"
+                          onClick={() => {
+                            setMode(opt);
+                            setShowModeMenu(false);
+                          }}
+                          className={cx(
+                            "flex w-full items-center justify-between px-4 py-3 text-sm font-semibold transition",
+                            opt === mode
+                              ? "text-cyan-200 bg-cyan-500/10"
+                              : "text-slate-200 hover:bg-slate-800/60"
+                          )}
+                        >
+                          <span className="flex items-center gap-3">
+                            <span className="h-2.5 w-2.5 rounded-full bg-linear-to-r from-cyan-300 to-emerald-300 shadow-[0_0_12px_rgba(94,234,212,0.5)]" />
+                            {modeLabels[opt]}
+                          </span>
+                          {opt === mode ? (
+                            <svg
+                              className="h-4 w-4 text-cyan-200"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M5 12l4 4L19 7" />
+                            </svg>
+                          ) : null}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div
+                  className={cx(
+                    "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold",
+                    mode === "general" && "border-sky-500/30 bg-sky-500/15 text-sky-100",
+                    mode === "local" && "border-emerald-500/30 bg-emerald-500/15 text-emerald-100",
+                    mode === "search" && "border-amber-400/30 bg-amber-400/15 text-amber-100"
+                  )}
                 >
-                  <option className="bg-[#0f1620] text-slate-100" value="auto">
-                    Auto
-                  </option>
-                  <option className="bg-[#0f1620] text-slate-100" value="local">
-                    Local
-                  </option>
-                  <option className="bg-[#0f1620] text-slate-100" value="general">
-                    General
-                  </option>
-                  <option className="bg-[#0f1620] text-slate-100" value="search">
-                    Search
-                  </option>
-                </select>
-                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-cyan-200">
-                  ▾
-                </span>
+                  {mode === "general" && (
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M3 12h18" />
+                      <path d="M12 3a15 15 0 0 1 0 18" />
+                      <path d="M12 3a15 15 0 0 0 0 18" />
+                    </svg>
+                  )}
+                  {mode === "local" && (
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M4 7a2 2 0 0 1 2-2h5l2 2h5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" />
+                    </svg>
+                  )}
+                  {mode === "search" && (
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="11" cy="11" r="7" />
+                      <path d="M20 20l-3.5-3.5" />
+                    </svg>
+                  )}
+                  <span className="text-[13px]">{modeLabels[mode]}</span>
+                </div>
+
               </div>
 
               <div className="flex items-center gap-2">
-                {/* Docs dropdown */}
-                <div className="relative">
-                  <select
-                    className="select-modern appearance-none rounded-xl border border-slate-800/70 bg-linear-to-r from-[#0f1823] via-[#0f1c28] to-[#0b1420] px-3 py-1.5 pr-8 text-xs font-semibold text-slate-200 shadow-sm focus:outline-none focus:ring-0 focus:border-cyan-500/40 hover:border-cyan-400/50 transition"
-                    value={selectedDoc}
-                    onChange={(e) => setSelectedDoc(e.target.value)}
-                    title="Documents in data/documents"
-                  >
-                    {docs.length === 0 ? (
-                      <option className="bg-[#0f1620] text-slate-100" value="">
-                        No docs
-                      </option>
-                    ) : (
-                      docs.map((d) => (
-                        <option key={d.name} className="bg-[#0f1620] text-slate-100" value={d.name}>
-                          {d.name}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-cyan-200">
-                    ▾
-                  </span>
-                </div>
-
-                {/* Upload (file picker) */}
-                <label
-                  className={cx(
-                    controlButtonBase,
-                    uploading ? controlButtonDisabled : controlButtonActive
-                  )}
-                  title="Upload a document into data/documents and auto-index"
-                >
-                  {uploading ? "Uploading…" : "Upload"}
-                  <input
-                    type="file"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) uploadDoc(f);
-                      e.currentTarget.value = "";
-                    }}
-                    disabled={uploading}
-                  />
-                </label>
-
-                {/* Index status pill */}
-                <div
-                  className={cx(
-                    "rounded-xl border px-3 py-1.5 text-xs font-semibold",
-                    indexStatus?.state === "running" && "border-cyan-500/30 text-cyan-200 bg-cyan-500/10",
-                    indexStatus?.state === "ok" && "border-emerald-500/25 text-emerald-200 bg-emerald-500/10",
-                    indexStatus?.state === "error" && "border-rose-500/25 text-rose-200 bg-rose-500/10",
-                    (!indexStatus || indexStatus?.state === "idle") && "border-slate-800/70 text-slate-300 bg-slate-950/40"
-                  )}
-                  title={
-                    indexStatus?.state === "error"
-                      ? indexStatus?.last_error ?? "Index error"
-                      : indexStatus?.stats
-                        ? `files=${indexStatus.stats.files_on_disk}, indexed=${indexStatus.stats.indexed_files}, skipped=${indexStatus.stats.skipped_files}, deleted=${indexStatus.stats.deleted_files}`
-                        : "Index status"
-                  }
-                >
-                  {indexStatus?.is_indexing ? "Indexing…" : `Index: ${indexStatus?.state ?? "…"}`}
-                </div>
-
-                {/* Index now */}
+                {/* Mic */}
                 <button
-                  onClick={startIndexNow}
-                  disabled={!!indexStatus?.is_indexing || indexStarting}
+                  onClick={toggleRecording}
+                  disabled={loading}
                   className={cx(
-                    controlButtonBase,
-                    indexStatus?.is_indexing || indexStarting ? controlButtonDisabled : controlButtonActive
+                    "h-9 w-10 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
+                    isRecording
+                      ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20 hover:shadow-[0_0_30px_rgba(244,63,94,0.25)]"
+                      : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)]"
                   )}
-                  title="Run indexing now"
+                  title={isRecording ? "Stop recording" : "Start recording"}
                 >
-                  Index now
+                  {isRecording ? (
+                    <span className="inline-flex h-3.5 w-3.5 rounded-sm bg-rose-200" />
+                  ) : (
+                    <svg
+                      className="mx-auto h-4.5 w-4.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z" />
+                      <path d="M19 11a7 7 0 0 1-14 0" />
+                      <path d="M12 18v3" />
+                      <path d="M8 21h8" />
+                    </svg>
+                  )}
+                </button>
+
+                {/* Mute */}
+                <button
+                  onClick={() => {
+                    setTtsMuted((m) => {
+                      const next = !m;
+                      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      spokenRef.current = "";
+                      return next;
+                    });
+                  }}
+                  className={cx(
+                    "h-9 w-9 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
+                    ttsMuted
+                      ? "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10"
+                      : "border-cyan-400/60 bg-cyan-500/10 text-cyan-100"
+                  )}
+                  title={ttsMuted ? "Unmute voice" : "Mute voice"}
+                >
+                  {ttsMuted ? (
+                    <svg
+                      className="mx-auto h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M11 5L6 9H3v6h3l5 4z" />
+                      <path d="M19 9l-4 4 4 4" />
+                    </svg>
+                  ) : (
+                    <svg
+                      className="mx-auto h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M11 5L6 9H3v6h3l5 4z" />
+                      <path d="M15 9a3 3 0 0 1 0 6" />
+                    </svg>
+                  )}
                 </button>
 
                 {/* Clear */}
                 <button
                   onClick={clearChat}
-                  className={cx(controlButtonBase, controlButtonActive)}
+                  className="h-9 w-9 rounded-2xl border border-slate-800/70 bg-slate-950/40 text-slate-200 transition duration-200 hover:border-rose-400/60 hover:bg-rose-500/10 active:translate-y-px active:scale-[0.98]"
                   title="Clear chat"
                 >
-                  Clear
+                  <svg
+                    className="mx-auto h-4 w-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 6h18" />
+                    <path d="M8 6V4h8v2" />
+                    <path d="M6 6l1 14h10l1-14" />
+                  </svg>
                 </button>
-                {/* TTS controls */}
+
                 <button
-                  onClick={() => {
-                    setTtsMuted((m) => {
-                      const next = !m;
-                      // Always stop current speech when toggling mute
-                      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-                        window.speechSynthesis.cancel();
-                      }
-                      // Reset so the next content can be spoken again
-                      spokenRef.current = "";
-                      return next;
-                    });
-                  }}
-                  className={cx(controlButtonBase, controlButtonActive)}
-                  title={ttsMuted ? "Unmute voice" : "Mute voice"}
+                  onClick={ask}
+                  disabled={!canAsk}
+                  className={cx(
+                    "w-20 mb-1 rounded-2xl px-3 py-2 text-sm font-semibold transition relative overflow-hidden active:translate-y-px active:scale-[0.99]",
+                    canAsk ? "text-white shadow-lg shadow-slate-900/40" : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                  )}
                 >
-                  {ttsMuted ? "Unmute 🔊" : "Mute 🔇"}
+                  {canAsk && (
+                    <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />
+                  )}
+                  <span className={cx("relative flex items-center justify-center gap-2", canAsk ? "drop-shadow" : "")}>
+                    {loading ? (
+                      <span className="inline-flex items-center gap-2">
+                        <span className="h-4 w-4 animate-spin rounded-full border border-white/40 border-t-white/90" />
+                      </span>
+                    ) : (
+                      <>
+                        <svg
+                          className="h-4 w-4"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.6"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M21 12L3 4l4 8-4 8 18-8z" />
+                          <path d="M7 12h8" />
+                        </svg>
+                        <span>Ask</span>
+                      </>
+                    )}
+                  </span>
                 </button>
-
               </div>
-
-            </div>
-
-            <div className="mt-2 flex items-end gap-3">
-              <textarea
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                onKeyDown={onKeyDown}
-                placeholder='Try: "Summarize my resume in 3 bullets" or "How do computers work?"'
-                className="flex-1 min-h-16 w-200 h-16 resize-y rounded-2xl border border-slate-800/70 bg-[#0d131c] px-4 py-3 text-sm leading-relaxed transition outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 focus:border-slate-800/70"
-              />
-              {/* Mic */}
-              <button
-                onClick={toggleRecording}
-                disabled={loading}
-                className={cx(
-                  "h-14 w-14 mb-1 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px",
-                  isRecording
-                    ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20 hover:shadow-[0_0_30px_rgba(244,63,94,0.25)] active:scale-[0.98]"
-                    : "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-cyan-400/60 hover:bg-cyan-500/10 hover:shadow-[0_12px_45px_rgba(34,211,238,0.18)] active:scale-[0.98] active:border-cyan-300/70 active:bg-cyan-500/15"
-                )}
-                title={isRecording ? "Stop recording" : "Start recording"}
-              >
-                {isRecording ? "■" : "🎤"}
-              </button>
-
-              <button
-                onClick={ask}
-                disabled={!canAsk}
-                className={cx(
-                  "rounded-2xl px-4 py-2 h-14 mb-1 text-sm font-semibold transition relative overflow-hidden",
-                  canAsk ? "text-white shadow-lg shadow-slate-900/40" : "bg-slate-800 text-slate-500 cursor-not-allowed"
-                )}
-              >
-                {canAsk && <span className="absolute inset-0 bg-linear-to-r from-cyan-600 via-cyan-500 to-emerald-400 opacity-90" />}
-                <span className={cx("relative", canAsk ? "drop-shadow" : "")}>{loading ? "Generating…" : "Ask"}</span>
-              </button>
             </div>
 
             {/* mic error + option */}
