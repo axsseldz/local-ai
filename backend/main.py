@@ -103,10 +103,6 @@ class AskRequest(BaseModel):
     top_k: int = 6
     task: str | None = None   
 
-class RememberRequest(BaseModel):
-    content: str
-    source: str = "manual"
-
 async def _run_index_job(trigger: str):
     if INDEX_LOCK.locked():
         return False
@@ -204,23 +200,6 @@ async def ollama_stream(prompt: str, model: str):
 
                 if obj.get("done"):
                     break
-
-async def ollama_generate(prompt: str, model: str) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False, 
-        "options": {
-            "num_ctx": 4096,
-            "temperature": 0.6,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", "")
     
 async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict]:
     q_vec = (await embed_texts([question]))[0]
@@ -422,24 +401,6 @@ def get_vosk_model():
         _vosk_model = Model(str(VOSK_MODEL_PATH))
     return _vosk_model
 
-def _get_whisper_model():
-    global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
-        try:
-            from faster_whisper import WhisperModel
-        except Exception as e:
-            raise RuntimeError(
-                "Missing dependency for voice: `faster-whisper`. "
-                "Install with: pip install faster-whisper"
-            ) from e
-        
-        _WHISPER_MODEL = WhisperModel(
-            WHISPER_MODEL_NAME,
-            device="cpu",
-            compute_type="int8",
-        )
-    return _WHISPER_MODEL
-
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -450,12 +411,6 @@ def infer_task(question: str) -> str:
         return "summary"
     return "qa"
 
-def should_fallback_to_general(vector_ids: list[int], scores: list[float]) -> bool:
-    if not vector_ids:
-        return True
-    best = scores[0] if scores else 0.0
-    return best < 0.38  
-
 def load_faiss_index():
     idx_path = Path(__file__).parent / "vector_index" / "index.faiss"
     if not idx_path.exists():
@@ -464,10 +419,6 @@ def load_faiss_index():
     if not isinstance(idx, faiss.IndexIDMap2):
         idx = faiss.IndexIDMap2(idx)
     return idx
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 @app.get("/api/metrics")
 def metrics():
@@ -519,56 +470,6 @@ def docs_list():
 def index_status():
     return INDEX_STATUS
 
-@app.get("/memory/search")
-def memory_search(q: str, limit: int = 10):
-    return {"results": search_memory(q, limit)}
-
-@app.post("/voice/transcribe")
-async def voice_transcribe(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="Missing audio file")
-
-    suffix = Path(file.filename or "audio").suffix or ".webm"
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        src_path = td_path / f"input{suffix}"
-        wav_path = td_path / "audio.wav"
-        src_path.write_bytes(await file.read())
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            str(wav_path),
-        ]
-
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            raise HTTPException(
-                status_code=500,
-                detail="ffmpeg failed. Install with: brew install ffmpeg",
-            )
-
-        try:
-            model = _get_whisper_model()
-            segments, info = model.transcribe(
-                str(wav_path),
-                beam_size=1,
-                vad_filter=True,
-            )
-            text = "".join(seg.text for seg in segments).strip()
-        except RuntimeError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Transcription error: {type(e).__name__}: {str(e)}")
-
-    return {"text": text}
-
 @app.post("/docs/upload")
 async def docs_upload(file: UploadFile = File(...)):
     filename = os.path.basename(file.filename or "upload.bin")
@@ -602,153 +503,6 @@ async def index_run():
 
     asyncio.create_task(_run_index_job("manual"))
     return {"ok": True, "started": True, "status": INDEX_STATUS}
-
-@app.post("/remember")
-def remember(req: RememberRequest):
-    mem_id = add_memory(req.content, req.source)
-    return {"ok": True, "id": mem_id}
-
-@app.post("/ask")
-async def ask(req: AskRequest):
-    model = req.model or DEFAULT_MODEL
-    task = req.task or infer_task(req.question)
-
-    async def run_general() -> dict:
-        prompt = (
-            "You are a helpful assistant.\n"
-            "Keep answers short by default; only go long if the user explicitly asks.\n"
-            "Do NOT invent sources.\n\n"
-            f"{FORMAT_RULES}\n"
-            f"QUESTION:\n{req.question}\n"
-        )
-        try:
-            answer = await ollama_generate(prompt, model)
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
-
-        return {
-            "answer": answer,
-            "mode": "general",
-            "task": task,
-            "sources": [],
-            "used_tools": ["ollama"],
-            "model": model,
-        }
-
-    async def run_local() -> dict:
-        q_vec = (await embed_texts([req.question]))[0]
-        index = load_faiss_index()
-
-        if index is None:
-            return {
-                "answer": "No local index found yet. Run indexing first, or use General mode.",
-                "mode": "local",
-                "task": task,
-                "sources": [],
-                "used_tools": ["ollama", "faiss", "sqlite"],
-                "model": model,
-            }
-
-        k = req.top_k
-        if task == "summary":
-            k = max(k, 12) 
-
-        scores, vector_ids = faiss_search(index, q_vec, top_k=k)
-        chunks = get_chunks_by_vector_ids(vector_ids)
-
-        if not chunks:
-            return {
-                "answer": "I couldn't find anything relevant in your local documents.",
-                "mode": "local",
-                "task": task,
-                "sources": [],
-                "used_tools": ["ollama", "faiss", "sqlite"],
-                "model": model,
-            }
-
-        context_blocks = []
-        sources = []
-        for i, ch in enumerate(chunks):
-            label = f"S{i+1}"
-            context_blocks.append(
-                f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
-            )
-            src_score = scores[i] if i < len(scores) else None
-            sources.append({
-                "label": label,
-                "doc_path": ch["doc_path"],
-                "chunk_index": ch["chunk_index"],
-                "score": float(src_score) if src_score is not None else None,
-            })
-
-        prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
-
-        if prompt is None:
-            return {
-                "answer": "I couldn't find anything relevant in your local documents.",
-                "mode": "local",
-                "task": task,
-                "sources": [],
-                "used_tools": ["ollama", "faiss", "sqlite"],
-                "model": model,
-                "retrieval": retrieval,
-            }
-
-        try:
-            answer = await ollama_generate(prompt, model)
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Cannot connect to Ollama. Is `ollama serve` running?")
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {str(e)}")
-
-        return {
-            "answer": answer,
-            "mode": "local",
-            "task": task,
-            "sources": sources,
-            "used_tools": ["ollama", "faiss", "sqlite"],
-            "model": model,
-            "retrieval": retrieval,
-        }
-
-    mode = (req.mode or "local").lower().strip()
-
-    if mode == "general":
-        return await run_general()
-
-    if mode == "local":
-        return await run_local()
-    
-    if mode == "search":
-        try:
-            results = await brave_web_search(req.question, count=5)
-            if not results:
-                return {
-                    "answer": "No web results found for that query.",
-                    "mode": "search",
-                    "task": task,
-                    "sources": [],
-                    "used_tools": ["brave_search", "ollama"],
-                    "model": model,
-                }
-
-            prompt = build_web_prompt(req.question, results)
-            answer = await ollama_generate(prompt, model)
-
-            return {
-                "answer": answer,
-                "mode": "search",
-                "task": task,
-                "sources": results,
-                "used_tools": ["brave_search", "ollama"],
-                "model": model,
-            }
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Brave Search error: {str(e)}")
-
-    raise HTTPException(status_code=400, detail="Unsupported mode. Use 'local', 'general', or 'search'.")
 
 @app.post("/ask/stream")
 async def ask_stream(req: AskRequest):
