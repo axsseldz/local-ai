@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { JSX, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import RadarBackground from "@/components/RadarBackground";
@@ -718,6 +718,54 @@ export default function Page() {
     general: "General",
     search: "Search",
   };
+  const modeIcons: Record<Mode, () => JSX.Element> = {
+    general: () => (
+      <svg
+        className="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18" />
+        <path d="M12 3a15 15 0 0 1 0 18" />
+        <path d="M12 3a15 15 0 0 0 0 18" />
+      </svg>
+    ),
+    local: () => (
+      <svg
+        className="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M4 7a2 2 0 0 1 2-2h5l2 2h5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" />
+      </svg>
+    ),
+    search: () => (
+      <svg
+        className="h-4 w-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="11" cy="11" r="7" />
+        <path d="M20 20l-3.5-3.5" />
+      </svg>
+    ),
+  };
   const indexStats = indexStatus?.stats;
   const indexProgress =
     indexStats && indexStats.files_on_disk > 0
@@ -1297,12 +1345,12 @@ export default function Page() {
                           className={cx(
                             "flex w-full items-center justify-between px-4 py-3 text-sm font-semibold transition",
                             opt === mode
-                              ? "text-emerald-200 bg-emerald-500/10"
+                              ? "text-cyan-100 bg-cyan-500/15"
                               : "text-slate-200 hover:bg-slate-800/60"
                           )}
                         >
                           <span className="flex items-center gap-3">
-                            <span className="h-2.5 w-2.5 rounded-full bg-linear-to-r from-emerald-300 to-teal-300" />
+                            {modeIcons[opt]()}
                             {modeLabels[opt]}
                           </span>
                           {opt === mode ? (
@@ -1328,58 +1376,10 @@ export default function Page() {
 
                 <div
                   className={cx(
-                    "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold",
-                    mode === "general" && "border-emerald-500/40 bg-emerald-500/15 text-emerald-100",
-                    mode === "local" && "border-teal-500/40 bg-teal-500/15 text-teal-100",
-                    mode === "search" && "border-cyan-400/40 bg-cyan-500/15 text-cyan-100"
+                    "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold border-cyan-400/40 bg-cyan-500/15 text-cyan-100"
                   )}
                 >
-                  {mode === "general" && (
-                    <svg
-                      className="h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <circle cx="12" cy="12" r="9" />
-                      <path d="M3 12h18" />
-                      <path d="M12 3a15 15 0 0 1 0 18" />
-                      <path d="M12 3a15 15 0 0 0 0 18" />
-                    </svg>
-                  )}
-                  {mode === "local" && (
-                    <svg
-                      className="h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <path d="M4 7a2 2 0 0 1 2-2h5l2 2h5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" />
-                    </svg>
-                  )}
-                  {mode === "search" && (
-                    <svg
-                      className="h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <circle cx="11" cy="11" r="7" />
-                      <path d="M20 20l-3.5-3.5" />
-                    </svg>
-                  )}
+                  {modeIcons[mode]()}
                   <span className="text-[13px]">{modeLabels[mode]}</span>
                 </div>
 
@@ -1391,15 +1391,15 @@ export default function Page() {
                   onClick={toggleRecording}
                   disabled={loading}
                   className={cx(
-                    "h-9 w-10 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
+                    "h-9 w-10 rounded-2xl text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
                     isRecording
-                      ? "border-rose-400/70 bg-rose-500/15 text-rose-100 hover:border-rose-300/70 hover:bg-rose-500/20"
-                      : "border-slate-800/70 bg-black/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10"
+                      ? "bg-cyan-500/20 text-cyan-100 hover:bg-cyan-500/30"
+                      : "bg-cyan-500/10 text-cyan-100 hover:bg-cyan-500/20"
                   )}
                   title={isRecording ? "Stop recording" : "Start recording"}
                 >
                   {isRecording ? (
-                    <span className="inline-flex h-3.5 w-3.5 rounded-sm bg-rose-200" />
+                    <span className="inline-flex h-3.5 w-3.5 rounded-sm bg-cyan-200" />
                   ) : (
                     <svg
                       className="mx-auto h-4.5 w-4.5"
@@ -1432,10 +1432,10 @@ export default function Page() {
                     });
                   }}
                   className={cx(
-                    "h-9 w-9 rounded-2xl border text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
+                    "h-9 w-10 rounded-2xl text-lg font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-px active:scale-[0.98]",
                     ttsMuted
-                      ? "border-slate-800/70 bg-black/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10"
-                      : "border-emerald-300/60 bg-emerald-500/10 text-emerald-100"
+                      ? "bg-cyan-500/10 text-cyan-200/80 hover:bg-cyan-500/30"
+                      : "bg-cyan-500/10 text-cyan-100 hover:bg-cyan-500/20"
                   )}
                   title={ttsMuted ? "Unmute voice" : "Mute voice"}
                 >
@@ -1473,7 +1473,7 @@ export default function Page() {
                 {/* Clear */}
                 <button
                   onClick={clearChat}
-                  className="h-9 w-9 rounded-2xl border border-slate-800/70 bg-black/40 text-slate-200 transition duration-200 hover:border-rose-400/60 hover:bg-rose-500/10 active:translate-y-px active:scale-[0.98]"
+                  className="h-9 w-10 rounded-2xl bg-cyan-500/10 text-cyan-100 transition duration-200 hover:bg-cyan-500/20 active:translate-y-px active:scale-[0.98]"
                   title="Clear chat"
                 >
                   <svg

@@ -22,6 +22,8 @@ import subprocess
 import time
 import re
 
+load_dotenv()
+
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "llama3.1:8b"
 BASE_DIR = Path(__file__).resolve().parent.parent 
