@@ -13,12 +13,12 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 def load_or_create(dim: int) -> faiss.IndexIDMap2:
     if INDEX_PATH.exists():
         idx = faiss.read_index(str(INDEX_PATH))
-        # ensure it's an IDMap
+
         if not isinstance(idx, faiss.IndexIDMap2):
             idx = faiss.IndexIDMap2(idx)
         return idx
 
-    base = faiss.IndexFlatIP(dim)  # cosine similarity after normalization
+    base = faiss.IndexFlatIP(dim)  
     idx = faiss.IndexIDMap2(base)
     faiss.write_index(idx, str(INDEX_PATH))
     return idx

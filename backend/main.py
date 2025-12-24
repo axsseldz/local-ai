@@ -24,13 +24,15 @@ import re
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "llama3.1:8b"
-BASE_DIR = Path(__file__).resolve().parent.parent  # local-ai/
+BASE_DIR = Path(__file__).resolve().parent.parent 
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_INTERVAL_SECONDS = 180  # 3 minutes (tune later)
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")  # tiny | base | small | medium
-_WHISPER_MODEL = None  # lazy-loaded singleton
+INDEX_INTERVAL_SECONDS = 180 
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small") 
 VOSK_MODEL_PATH = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+_WHISPER_MODEL = None 
 _vosk_model = None
 
 FORMAT_RULES = (
@@ -46,14 +48,14 @@ FORMAT_RULES = (
     "- Do not output stray asterisks. Bold must be exactly **like this**.\n"
 )
 
-BASE_DIR = Path(__file__).resolve().parents[1]  # local-ai/
+BASE_DIR = Path(__file__).resolve().parents[1]  
 load_dotenv(BASE_DIR / ".env")
 
 INDEX_LOCK = asyncio.Lock()
 INDEX_STATUS = {
-    "state": "idle",               # idle | running | ok | error
+    "state": "idle",               
     "is_indexing": False,
-    "last_trigger": None,          # "startup" | "scheduled" | "manual"
+    "last_trigger": None,          
     "last_started_at": None,
     "last_finished_at": None,
     "last_error": None,
@@ -95,12 +97,10 @@ def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
         m2 = re.search(rf"{re.escape(key)}:\s+([\d]+)\.", out)
         return int(m2.group(1)) if m2 else 0
 
-    # Treat these as truly "used" (non-reclaimable-ish)
     active = grab("Pages active")
     wired = grab("Pages wired down")
     compressed = grab("Pages occupied by compressor")
 
-    # Total ≈ sum of the major buckets
     total_pages = sum(
         grab(k)
         for k in [
@@ -119,7 +119,6 @@ def _parse_vm_stat(out: str) -> tuple[int | None, int | None]:
 
     used_pages = active + wired + compressed
     return used_pages * page_size, total_pages * page_size
-
 
 def _parse_swap(out: str) -> tuple[int | None, int | None]:
     if not out:
@@ -169,14 +168,7 @@ def _get_metal_status() -> bool | None:
     _METAL_CACHE["ts"] = now
     return supported
 
-BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
-BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
-
 async def brave_web_search(query: str, count: int = 5):
-    """
-    Calls Brave Search API and returns normalized results:
-    [{label, title, url, snippet}]
-    """
     if not BRAVE_SEARCH_API_KEY:
         raise HTTPException(status_code=500, detail="BRAVE_SEARCH_API_KEY not set in .env")
 
@@ -190,7 +182,6 @@ async def brave_web_search(query: str, count: int = 5):
         "count": count,
         "search_lang": "en",
         "safesearch": "moderate",
-        # You can add freshness like: "freshness": "week"
     }
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -229,7 +220,6 @@ def build_web_prompt(question: str, results: list[dict]) -> str:
         "WEB SOURCES:\n" + "\n\n".join(blocks) + "\n"
     )
 
-
 def get_vosk_model():
     global _vosk_model
     if _vosk_model is None:
@@ -248,8 +238,7 @@ def _get_whisper_model():
                 "Missing dependency for voice: `faster-whisper`. "
                 "Install with: pip install faster-whisper"
             ) from e
-
-        # CPU-friendly defaults. (Works great on Mac; you can tune later.)
+        
         _WHISPER_MODEL = WhisperModel(
             WHISPER_MODEL_NAME,
             device="cpu",
@@ -261,7 +250,6 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 async def _run_index_job(trigger: str):
-    # Prevent overlapping runs
     if INDEX_LOCK.locked():
         return False
 
@@ -279,8 +267,6 @@ async def _run_index_job(trigger: str):
         except Exception as e:
             INDEX_STATUS["state"] = "error"
             INDEX_STATUS["last_error"] = f"{type(e).__name__}: {str(e)}"
-            # Optional: keep traceback for debugging
-            # print(traceback.format_exc())
         finally:
             INDEX_STATUS["is_indexing"] = False
             INDEX_STATUS["last_finished_at"] = _now_iso()
@@ -288,15 +274,12 @@ async def _run_index_job(trigger: str):
     return True
 
 async def _index_daemon(stop_event: asyncio.Event):
-    # Run once on startup
     await _run_index_job("startup")
 
     while not stop_event.is_set():
         try:
-            # wait N seconds or stop
             await asyncio.wait_for(stop_event.wait(), timeout=INDEX_INTERVAL_SECONDS)
         except asyncio.TimeoutError:
-            # time to run scheduled indexing
             await _run_index_job("scheduled")
 
 @asynccontextmanager
@@ -328,10 +311,10 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    mode: str = "local"  # local | general | search
+    mode: str = "local" 
     model: str | None = None
     top_k: int = 6
-    task: str | None = None     # qa | summary | None (auto-infer)
+    task: str | None = None   
 
 class RememberRequest(BaseModel):
     content: str
@@ -345,20 +328,12 @@ def infer_task(question: str) -> str:
     return "qa"
 
 def should_fallback_to_general(vector_ids: list[int], scores: list[float]) -> bool:
-    """
-    Heuristic: if we retrieved nothing OR the best similarity score is low,
-    the question is probably not answerable from local docs.
-    Tune threshold based on your embeddings/model.
-    """
     if not vector_ids:
         return True
     best = scores[0] if scores else 0.0
-    return best < 0.38  # adjust if needed (0.33-0.45 typical)
+    return best < 0.38  
 
 async def ollama_stream(prompt: str, model: str):
-    """
-    Yields text chunks from Ollama as they arrive (NDJSON stream).
-    """
     payload = {
         "model": model,
         "prompt": prompt,
@@ -529,25 +504,15 @@ def metrics():
 
 @app.post("/voice/transcribe")
 async def voice_transcribe(file: UploadFile = File(...)):
-    """
-    Local speech-to-text.
-    Frontend sends a recorded audio blob (webm/m4a/etc).
-    We normalize with ffmpeg -> wav(16k, mono) then run Whisper locally.
-    """
     if not file:
         raise HTTPException(status_code=400, detail="Missing audio file")
 
-    # Save upload to temp
     suffix = Path(file.filename or "audio").suffix or ".webm"
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         src_path = td_path / f"input{suffix}"
         wav_path = td_path / "audio.wav"
-
         src_path.write_bytes(await file.read())
-
-        # Convert to 16k mono wav for consistent Whisper input
-        # Requires: brew install ffmpeg
         cmd = [
             "ffmpeg",
             "-y",
@@ -589,7 +554,7 @@ def docs_list():
     for p in sorted(DOCS_DIR.glob("*")):
         if not p.is_file():
             continue
-        # keep it simple; you can filter extensions later
+
         st = p.stat()
         items.append({
             "name": p.name,
@@ -601,11 +566,9 @@ def docs_list():
 
 @app.post("/docs/upload")
 async def docs_upload(file: UploadFile = File(...)):
-    # Basic safety: no directories
     filename = os.path.basename(file.filename or "upload.bin")
     dest = DOCS_DIR / filename
 
-    # Avoid overwriting: add suffix if exists
     if dest.exists():
         stem = dest.stem
         suf = dest.suffix
@@ -620,7 +583,6 @@ async def docs_upload(file: UploadFile = File(...)):
     content = await file.read()
     dest.write_bytes(content)
 
-    # Kick indexing in background (do NOT block)
     try:
         asyncio.create_task(_run_index_job("upload"))
     except Exception:
@@ -634,7 +596,6 @@ def index_status():
 
 @app.post("/index/run")
 async def index_run():
-    # fire-and-forget (don’t block request)
     if INDEX_LOCK.locked():
         return {"ok": False, "started": False, "status": INDEX_STATUS}
 
@@ -655,7 +616,6 @@ async def ask(req: AskRequest):
     model = req.model or DEFAULT_MODEL
     task = req.task or infer_task(req.question)
 
-    # ---------- GENERAL MODE ----------
     async def run_general() -> dict:
         prompt = (
             "You are a helpful assistant.\n"
@@ -680,15 +640,11 @@ async def ask(req: AskRequest):
             "model": model,
         }
 
-    # ---------- LOCAL MODE ----------
     async def run_local() -> dict:
-        # 1) Embed the question
         q_vec = (await embed_texts([req.question]))[0]
-
-        # 2) Load FAISS index
         index = load_faiss_index()
+
         if index is None:
-            # No local KB yet
             return {
                 "answer": "No local index found yet. Run indexing first, or use General mode.",
                 "mode": "local",
@@ -698,10 +654,9 @@ async def ask(req: AskRequest):
                 "model": model,
             }
 
-        # 3) Retrieval settings
         k = req.top_k
         if task == "summary":
-            k = max(k, 12)  # summaries usually need more context
+            k = max(k, 12) 
 
         scores, vector_ids = faiss_search(index, q_vec, top_k=k)
         chunks = get_chunks_by_vector_ids(vector_ids)
@@ -716,7 +671,6 @@ async def ask(req: AskRequest):
                 "model": model,
             }
 
-        # 4) Build context blocks + sources
         context_blocks = []
         sources = []
         for i, ch in enumerate(chunks):
@@ -731,25 +685,6 @@ async def ask(req: AskRequest):
                 "chunk_index": ch["chunk_index"],
                 "score": float(src_score) if src_score is not None else None,
             })
-
-        # 5) Task-aware instructions (QA vs Summary)
-        if task == "summary":
-            instructions = (
-                "TASK: Summarize using ONLY the provided SOURCES.\n"
-                "You MUST synthesize a summary even if the sources are split across chunks.\n"
-                "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
-                "If important sections are missing, make a partial summary and say what seems missing.\n"
-                "Follow the user's format request (e.g. bullet points).\n"
-                "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-                "Do NOT cite or mention source IDs or filenames in the answer.\n"
-            )
-        else:
-            instructions = (
-                "TASK: Answer using ONLY the provided SOURCES.\n"
-                "If the answer cannot be found in the sources, say 'I don't know'.\n"
-                "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-                "Do NOT cite or mention source IDs or filenames in the answer.\n"
-            )
 
         prompt, sources, retrieval = await build_local_prompt_and_sources(req.question, task, req.top_k)
 
@@ -781,7 +716,6 @@ async def ask(req: AskRequest):
             "retrieval": retrieval,
         }
 
-    # ---------- ROUTING ----------
     mode = (req.mode or "local").lower().strip()
 
     if mode == "general":
@@ -791,7 +725,6 @@ async def ask(req: AskRequest):
         return await run_local()
     
     if mode == "search":
-    # Brave search -> local LLM synthesis
         try:
             results = await brave_web_search(req.question, count=5)
             if not results:
@@ -827,10 +760,10 @@ async def ask_stream(req: AskRequest):
     mode = (req.mode or "local").lower().strip()
 
     async def sse():
-        # Decide route + build prompt (without generating yet)
         final_mode = mode
         sources = []
         retrieval = {}
+        
         if mode == "general":
             prompt = (
                 "You are a helpful assistant.\n"
@@ -878,7 +811,6 @@ async def ask_stream(req: AskRequest):
             yield "event: done\ndata: {}\n\n"
             return
 
-        # Send meta first (frontend uses this to set sources/mode/task)
         meta = {
             "mode": final_mode,
             "task": task,
@@ -888,7 +820,6 @@ async def ask_stream(req: AskRequest):
         }
         yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
-        # Stream tokens
         start_time = time.time()
         first_chunk_time = None
         token_count = 0
@@ -900,7 +831,6 @@ async def ask_stream(req: AskRequest):
                     first_chunk_time = time.time()
                 token_count += len(chunk.split())
 
-                # Send chunks as JSON strings so newlines/special chars survive SSE framing.
                 yield f"event: chunk\ndata: {json.dumps(chunk)}\n\n"
         except httpx.ConnectError:
             yield f"event: chunk\ndata: {json.dumps('Cannot connect to Ollama. Is `ollama serve` running?')}\n\n"
@@ -928,7 +858,6 @@ async def voice_stt_ws(ws: WebSocket):
         await ws.close()
         return
 
-    # El frontend enviará PCM16 mono 16kHz
     recognizer = KaldiRecognizer(model, 16000)
     recognizer.SetWords(True)
 
@@ -936,7 +865,7 @@ async def voice_stt_ws(ws: WebSocket):
 
     try:
         while True:
-            data = await ws.receive_bytes()  # raw PCM16 bytes
+            data = await ws.receive_bytes()  
             if recognizer.AcceptWaveform(data):
                 res = json.loads(recognizer.Result())
                 text = (res.get("text") or "").strip()

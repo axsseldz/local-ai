@@ -85,7 +85,6 @@ def upsert_document(path_str: str, file_hash: str) -> int:
             )
             return int(cur.lastrowid)
 
-        # If doc existed, update hash/status/indexed_at
         conn.execute(
             "UPDATE documents SET file_hash=?, status='active', indexed_at=? WHERE id=?",
             (file_hash, now, int(row["id"])),
@@ -103,9 +102,6 @@ def list_active_document_paths() -> list[str]:
         return [r["path"] for r in rows]
 
 def mark_document_deleted(path_str: str) -> list[int]:
-    """
-    Mark doc as deleted and return vector_ids belonging to it (so FAISS can remove them).
-    """
     with get_conn() as conn:
         doc = conn.execute("SELECT id FROM documents WHERE path = ?", (path_str,)).fetchone()
         if not doc:
@@ -119,9 +115,6 @@ def mark_document_deleted(path_str: str) -> list[int]:
         return vector_ids
 
 def chunk_exists_for_doc(doc_id: int, file_hash: str) -> bool:
-    """
-    Not used directly; we skip reindexing via hash check at document level.
-    """
     return False
 
 def get_doc_hash_and_status(path_str: str):

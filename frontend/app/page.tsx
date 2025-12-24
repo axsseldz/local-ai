@@ -2,35 +2,21 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import ReactMarkdown from "react-markdown";
-import type { Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
 import RadarBackground from "@/components/RadarBackground";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Mode = "local" | "general" | "search";
 
 type Source = {
   label: string;
-
-  // local sources
   doc_path?: string;
   chunk_index?: number;
   score?: number | null;
-
-  // web sources
   title?: string;
   url?: string;
   snippet?: string;
-};
-
-type AskResponse = {
-  answer: string;
-  mode: string;
-  task?: string;
-  sources?: Source[];
-  used_tools?: string[];
-  model?: string;
 };
 
 type ChatMessage = {
@@ -92,53 +78,13 @@ type MetricsResponse = {
   };
 };
 
-function repairMarkdown(md: string) {
-  let s = (md || "").replace(/\r\n/g, "\n");
-
-  // 1) Fix bold/italic markers with extra spaces: ** bold ** -> **bold**
-  s = s.replace(/\*\*\s+([^*]+?)\s+\*\*/g, "**$1**");
-  s = s.replace(/_\s+([^_]+?)\s+_/g, "_$1_");
-  s = s.replace(/\*\s+([^*]+?)\s+\*/g, "*$1*");
-
-  // 2) If numbered list items are inline, force them onto new lines
-  // Example: "... processing: 1. **Input**: ... 2. **Hidden**: ..."
-  s = s.replace(/([^\n])\s+(\d+)\.\s+/g, "$1\n\n$2. ");
-
-  // 3) Same for bullet lists
-  s = s.replace(/([^\n])\s+-\s+/g, "$1\n\n- ");
-
-  // 4) Ensure headings start on a new line if they get glued
-  s = s.replace(/([^\n])\s+(#{1,3})\s+/g, "$1\n\n$2 ");
-
-  // 5) Clean up excessive blank lines
-  s = s.replace(/\n{3,}/g, "\n\n").trim();
-
-  return s;
-}
-
-function isProbablyMarkdown(text: string) {
-  // If any of these exist, we should NOT “pretty format” by rewriting spacing/newlines
-  // because it can break tables, code fences, lists, etc.
-  return (
-    text.includes("```") ||
-    /\n\s*[-*+]\s+/.test(text) ||              // lists
-    /\n\s*\d+\.\s+/.test(text) ||             // numbered lists
-    /\|\s*---\s*\|/.test(text) ||             // table separator
-    /\n\|.*\|\n\|/.test(text) ||              // table rows
-    /(^|\n)\s*#/.test(text) ||                // headings
-    /\*\*[^*]+\*\*/.test(text) ||             // bold
-    /`[^`]+`/.test(text)                      // inline code
-  );
-}
-
 function formatAssistantContent(message: ChatMessage) {
-  // Keep assistant output as-is to preserve Markdown. Only normalize newlines.
+
   if (message.role !== "assistant") return message.content;
 
   const text = message.content || "";
   if (!text) return "";
 
-  // Normalize CRLF and convert literal "\n" sequences if they appear.
   return text.replace(/\r\n/g, "\n").replace(/\\n/g, "\n");
 }
 
@@ -159,7 +105,6 @@ function floatTo16BitPCM(float32: Float32Array) {
   return out;
 }
 
-// downsample to 16kHz mono (simple + efectivo para MVP)
 function downsampleBuffer(buffer: Float32Array, sampleRate: number, outRate = 16000) {
   if (outRate === sampleRate) return buffer;
   const ratio = sampleRate / outRate;
@@ -189,7 +134,7 @@ export default function Page() {
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [indexStarting, setIndexStarting] = useState(false);
   const [docs, setDocs] = useState<DocItem[]>([]);
-  const [selectedDoc, setSelectedDoc] = useState<string>(""); // filename
+  const [selectedDoc, setSelectedDoc] = useState<string>("");
   const [uploading, setUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [micError, setMicError] = useState("");
@@ -199,23 +144,23 @@ export default function Page() {
   const [modeMenuPos, setModeMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
 
-  const spokenRef = useRef<string>(""); // avoid double-speaking
+  const spokenRef = useRef<string>("");
   const finalTranscriptRef = useRef<string>("");
   const chatRef = useRef<HTMLDivElement | null>(null);
   const modeMenuRef = useRef<HTMLDivElement | null>(null);
   const docsMenuRef = useRef<HTMLDivElement | null>(null);
   const docsButtonRef = useRef<HTMLButtonElement | null>(null);
   const modeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const modeMenuPortalRef = useRef<HTMLDivElement | null>(null);
+  const docsMenuPortalRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const spokenSentencesRef = useRef<Set<string>>(new Set());
-  const ttsRemainderRef = useRef<string>(""); // keeps leftover across chunks
-
-  // --- TTS ---
+  const ttsRemainderRef = useRef<string>("");
   const [ttsMuted, setTtsMuted] = useState(true);
-  const [liveTranscript, setLiveTranscript] = useState(""); // texto parcial live
+  const [liveTranscript, setLiveTranscript] = useState("");
 
 
   useEffect(() => {
@@ -280,8 +225,8 @@ export default function Page() {
     if (!showModeMenu && !showDocsMenu) return;
     const onDocClick = (e: MouseEvent) => {
       const target = e.target as Node;
-      const hitMode = modeMenuRef.current?.contains(target);
-      const hitDocs = docsMenuRef.current?.contains(target);
+      const hitMode = modeMenuRef.current?.contains(target) || modeMenuPortalRef.current?.contains(target);
+      const hitDocs = docsMenuRef.current?.contains(target) || docsMenuPortalRef.current?.contains(target);
       if (!hitMode) setShowModeMenu(false);
       if (!hitDocs) setShowDocsMenu(false);
     };
@@ -297,10 +242,7 @@ export default function Page() {
 
     const pickJarvis = () => {
       const voices = window.speechSynthesis.getVoices() || [];
-      // Force this exact voice if available
       const exact = voices.find(v => v.name === "Google UK English Male" && v.lang === "en-GB");
-
-      // Fallbacks if it’s not available on this machine/browser
       const fallback =
         exact ||
         voices.find(v => v.name.includes("Google UK English Male")) ||
@@ -324,13 +266,11 @@ export default function Page() {
     fetchIndexStatus();
 
     const t = setInterval(() => {
-      // poll faster while running
       const running = indexStatus?.is_indexing;
       if (running) fetchIndexStatus();
     }, 1200);
 
     const slow = setInterval(() => {
-      // poll slow when idle
       const running = indexStatus?.is_indexing;
       if (!running) fetchIndexStatus();
     }, 8000);
@@ -339,12 +279,9 @@ export default function Page() {
       clearInterval(t);
       clearInterval(slow);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexStatus?.is_indexing]);
 
-
   const canAsk = useMemo(() => question.trim().length > 0 && !loading, [question, loading]);
-
 
   async function ask() {
     await askWithText(question);
@@ -353,22 +290,13 @@ export default function Page() {
   function stripForSpeech(input: string) {
     let t = input || "";
 
-    // quita bloques de código
     t = t.replace(/```[\s\S]*?```/g, " ");
-
-    // quita inline code
     t = t.replace(/`([^`]+)`/g, "$1");
-
-    // quita markdown links [text](url) -> text
     t = t.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
-
-    // quita citas tipo [S1], [S2]
     t = t.replace(/\[S\d+\]/g, "");
-
-    // colapsa espacios
     t = t.replace(/\s+/g, " ").trim();
 
-    // evita leer el loader
+
     if (/^loading/i.test(t)) return "";
 
     return t;
@@ -380,30 +308,6 @@ export default function Page() {
       .replace(/\s+/g, " ")
       .replace(/\s+([.!?,])/g, "$1")
       .trim();
-  }
-
-  function pickMaleEnglishVoice(voices: SpeechSynthesisVoice[], preferredName?: string) {
-    if (!voices?.length) return null;
-
-    if (preferredName) {
-      const exact = voices.find(v => v.name === preferredName);
-      if (exact) return exact;
-    }
-
-    const en = voices.filter(v => v.lang?.startsWith("en"));
-
-    // Prioridad Mac “masculina” (común)
-    return (
-      en.find(v => /Alex/i.test(v.name)) ||
-      en.find(v => /Daniel/i.test(v.name)) ||
-      en.find(v => /Tom/i.test(v.name)) ||
-      en.find(v => /Fred/i.test(v.name)) ||
-      // fallback: evita Samantha/Victoria si puedes
-      en.find(v => !/Samantha|Victoria|Karen|Moira|Tessa/i.test(v.name)) ||
-      en[0] ||
-      voices[0] ||
-      null
-    );
   }
 
   function formatBytes(bytes?: number | null) {
@@ -426,7 +330,7 @@ export default function Page() {
     const text = stripForSpeech(rawText);
     if (!text) return;
 
-    // Avoid re-speaking identical sentence
+
     if (spokenRef.current === text) return;
     spokenRef.current = text;
 
@@ -436,8 +340,6 @@ export default function Page() {
       if (interrupt) window.speechSynthesis.cancel();
 
       const utterance = new SpeechSynthesisUtterance(text);
-
-      // Jarvis-ish tuning (slightly slower + deeper)
       utterance.rate = 0.98;
       utterance.pitch = 0.85;
       utterance.volume = 1.0;
@@ -478,7 +380,6 @@ export default function Page() {
 
       if (!r.ok) throw new Error("upload failed");
 
-      // refresh docs + index status soon
       await fetchDocs();
       setTimeout(fetchIndexStatus, 400);
     } finally {
@@ -492,7 +393,7 @@ export default function Page() {
       const data = (await r.json()) as IndexStatus;
       setIndexStatus(data);
     } catch {
-      // ignore (backend may be down)
+      // ignore 
     }
   }
 
@@ -500,7 +401,6 @@ export default function Page() {
     try {
       setIndexStarting(true);
       await fetch("http://localhost:8000/index/run", { method: "POST" });
-      // refresh quickly after starting
       setTimeout(fetchIndexStatus, 400);
     } finally {
       setIndexStarting(false);
@@ -519,8 +419,6 @@ export default function Page() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // 1) WS connect
       const ws = new WebSocket("ws://localhost:8000/voice/stt/ws");
       wsRef.current = ws;
 
@@ -529,13 +427,12 @@ export default function Page() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "partial") {
             setLiveTranscript(msg.text || "");
-            // “preview” en textarea mientras hablas:
             setQuestion(msg.text || "");
           } else if (msg.type === "final") {
             const finalText = (msg.text || "").trim();
             if (finalText) {
-              finalTranscriptRef.current = finalText; // ✅ store final transcript
-              setQuestion(finalText);                 // ✅ show it in textarea
+              finalTranscriptRef.current = finalText;
+              setQuestion(finalText);
             }
           } else if (msg.type === "error") {
             setMicError(msg.message || "STT error");
@@ -548,15 +445,12 @@ export default function Page() {
       ws.onerror = () => setMicError("WebSocket error (backend down?)");
       ws.onclose = () => { };
 
-      // 2) Audio graph -> ScriptProcessor -> PCM16 -> WS
       const AudioCtx = (window.AudioContext || (window as any).webkitAudioContext);
       const audioCtx = new AudioCtx();
       audioCtxRef.current = audioCtx;
 
       const source = audioCtx.createMediaStreamSource(stream);
       sourceRef.current = source;
-
-      // bufferSize 4096 es ok para MVP
       const processor = audioCtx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
@@ -564,7 +458,7 @@ export default function Page() {
         const wsNow = wsRef.current;
         if (!wsNow || wsNow.readyState !== WebSocket.OPEN) return;
 
-        const input = e.inputBuffer.getChannelData(0); // Float32
+        const input = e.inputBuffer.getChannelData(0);
         const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
         const pcm16 = floatTo16BitPCM(down);
 
@@ -585,28 +479,22 @@ export default function Page() {
     setIsRecording(false);
 
     const textToSend = (finalTranscriptRef.current || question).trim();
-    finalTranscriptRef.current = ""; // reset for next recording
-
-    // stop audio graph
+    finalTranscriptRef.current = "";
     processorRef.current?.disconnect();
     sourceRef.current?.disconnect();
-
     processorRef.current = null;
     sourceRef.current = null;
 
-    // close audio context
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => { });
       audioCtxRef.current = null;
     }
 
-    // close websocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.close();
     }
     wsRef.current = null;
 
-    // clear partial
     setLiveTranscript("");
 
     if (textToSend) {
@@ -614,13 +502,11 @@ export default function Page() {
     }
   }
 
-
   function toggleRecording() {
     if (isRecording) stopRecording();
     else startRecording();
   }
 
-  // Small helper so voice can send without relying on state timing
   async function askWithText(text: string) {
     const q = text.trim();
     if (!q || loading) return;
@@ -645,7 +531,7 @@ export default function Page() {
       isLoading: true,
     };
 
-    spokenRef.current = ""; // allow speaking for this new answer
+    spokenRef.current = "";
     spokenSentencesRef.current = new Set();
     ttsRemainderRef.current = "";
     setMessages((prev) => [...prev, userMsg, pendingAssistant]);
@@ -669,8 +555,6 @@ export default function Page() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
-      let assistantText = ""; // ✅ accumulate streamed answer for TTS
-      let ttsBuffer = ""; // keeps partial text until a sentence is complete
       let buffer = "";
       let metaApplied = false;
 
@@ -723,9 +607,9 @@ export default function Page() {
             setMessages((prev) =>
               prev.map((m) => (m.id === assistantId ? { ...m, isLoading: false } : m))
             );
-          };
+            continue;
+          }
 
-          // Backend sends streamed text as JSON strings to preserve newlines.
           let chunk = data;
 
           if (eventName === "chunk" || eventName === "message") {
@@ -733,34 +617,23 @@ export default function Page() {
               const parsed = JSON.parse(data);
               if (typeof parsed === "string") chunk = parsed;
             } catch {
-              // Backward compatibility for the old format: "data: <space>chunk"
               if (chunk.startsWith(" ")) chunk = chunk.slice(1);
             }
           }
 
           if (!metaApplied) metaApplied = true;
 
-          // accumulate locally for TTS
-          assistantText += chunk;
-
-          // --- sentence-level TTS (safe, no repeats) ---
           ttsRemainderRef.current += chunk;
 
-          // Consume complete sentences from the FRONT of the remainder.
-          // This avoids regex lastIndex bugs and prevents re-speaking the same sentence.
           while (true) {
             const r = ttsRemainderRef.current;
-
-            // find first sentence end
             const idx = r.search(/[.!?]/);
+
             if (idx === -1) break;
 
-            // include consecutive punctuation like "..." or "?!"
             let end = idx + 1;
             while (end < r.length && /[.!?]/.test(r[end])) end++;
 
-            // Only speak if we have at least a space or end after punctuation (helps reduce mid-word cuts)
-            // If next char exists and isn't whitespace, wait for more text.
             if (end < r.length && !/\s/.test(r[end])) break;
 
             const sentence = r.slice(0, end).trim();
@@ -770,14 +643,11 @@ export default function Page() {
               const key = normalizeSentenceForDedupe(sentence);
               if (key && !spokenSentencesRef.current.has(key)) {
                 spokenSentencesRef.current.add(key);
-                speakText(sentence, { interrupt: false }); // queue
+                speakText(sentence, { interrupt: false });
               }
             }
           }
 
-
-
-          // update UI
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
@@ -800,71 +670,7 @@ export default function Page() {
     }
   }
 
-  const mdComponents: Components = {
-    p: ({ children }) => <p className="my-3 leading-relaxed text-slate-100/95">{children}</p>,
-    ul: ({ children }) => <ul className="my-3 list-disc pl-6 space-y-1">{children}</ul>,
-    ol: ({ children }) => <ol className="my-3 list-decimal pl-6 space-y-1">{children}</ol>,
-    li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-    blockquote: ({ children }) => (
-      <blockquote className="my-4 border-l-2 border-slate-700/60 pl-4 text-slate-200/90">
-        {children}
-      </blockquote>
-    ),
-    h1: ({ children }) => <h1 className="mt-5 mb-2 text-xl font-semibold">{children}</h1>,
-    h2: ({ children }) => <h2 className="mt-5 mb-2 text-lg font-semibold">{children}</h2>,
-    h3: ({ children }) => <h3 className="mt-4 mb-2 text-base font-semibold">{children}</h3>,
-    a: ({ href, children }) => (
-      <a
-        href={href || "#"}
-        target="_blank"
-        rel="noreferrer"
-        className="text-emerald-300 hover:text-teal-200 underline underline-offset-4"
-      >
-        {children}
-      </a>
-    ),
-    table: ({ children }) => (
-      <div className="my-4 w-full overflow-x-auto">
-        <table className="w-full border-collapse text-sm">{children}</table>
-      </div>
-    ),
-    thead: ({ children }) => <thead className="bg-slate-900/60">{children}</thead>,
-    th: ({ children }) => (
-      <th className="border border-slate-800/70 px-3 py-2 text-left font-semibold text-slate-100">
-        {children}
-      </th>
-    ),
-    td: ({ children }) => (
-      <td className="border border-slate-800/70 px-3 py-2 text-slate-200/90">{children}</td>
-    ),
-    code: ({ className, children, ...props }) => {
-      const isBlock = typeof className === "string" && className.length > 0; // fenced code usually has a class like language-*
-      if (!isBlock) {
-        return (
-          <code
-            className="rounded-md border border-slate-800/70 bg-slate-950/60 px-1.5 py-0.5 text-[0.9em] text-slate-100 font-mono"
-            {...props}
-          >
-            {children}
-          </code>
-        );
-      }
-      return (
-        <code className={className} {...props}>
-          {children}
-        </code>
-      );
-    },
-    pre: ({ children }) => (
-      <pre className="my-4 overflow-x-auto rounded-2xl border border-slate-800/70 bg-[#0b111a] p-4 text-sm leading-relaxed text-slate-100 font-mono">
-        {children}
-      </pre>
-    ),
-  };
-
-
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    // Enter sends; Shift+Enter newline
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       ask();
@@ -880,12 +686,10 @@ export default function Page() {
     fetchDocs();
   }, []);
 
-  // Refresh docs list when indexing finishes successfully
   useEffect(() => {
     if (indexStatus?.state === "ok" && !indexStatus?.is_indexing) {
       fetchDocs();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexStatus?.last_finished_at]);
 
   useEffect(() => {
@@ -909,13 +713,6 @@ export default function Page() {
     };
   }, []);
 
-  const controlButtonBase =
-    "relative overflow-hidden rounded-xl border px-3 py-1.5 text-xs font-semibold transition duration-200 focus:outline-none focus-visible:outline-none focus:ring-0 focus:ring-offset-0 active:translate-y-[1px]";
-  const controlButtonActive =
-    "border-slate-800/70 bg-slate-950/40 text-slate-200 hover:border-emerald-300/60 hover:bg-emerald-500/10 active:scale-[0.98] active:border-teal-300/70 active:bg-teal-500/15 cursor-pointer";
-  const controlButtonDisabled = "border-slate-800/70 bg-slate-950/30 text-slate-500 cursor-not-allowed";
-  const copyButtonClass =
-    "group inline-flex items-center gap-1.5 rounded-xl border border-slate-800/70 bg-slate-950/50 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-emerald-300/60 hover:bg-emerald-500/10 hover:text-emerald-100 active:translate-y-[1px] active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/40";
   const modeLabels: Record<Mode, string> = {
     local: "Local",
     general: "General",
@@ -960,8 +757,10 @@ export default function Page() {
         <div className="absolute -bottom-40 -right-40 h-160 w-160 rounded-full blur-3xl opacity-35 bg-linear-to-r from-[#0d2420] via-[#0a1a18] to-transparent" />
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.02),transparent_60%)]" />
         <div className="absolute inset-0 opacity-[0.1] bg-[radial-gradient(circle_at_20%_15%,rgba(45,212,191,0.2),transparent_30%),radial-gradient(circle_at_85%_10%,rgba(32,194,170,0.2),transparent_28%),radial-gradient(circle_at_40%_78%,rgba(20,130,120,0.2),transparent_30%)]" />
-        <div className="absolute inset-0 opacity-[0.06] scan-grid" />
+        <div className="absolute inset-0 opacity-[0.06] scan-grid grid-warp" />
         <div className="absolute inset-0 scanlines" />
+        <div className="absolute inset-0 noise-shimmer" />
+        <div className="absolute inset-0 vignette-overlay" />
         <RadarBackground />
       </div>
 
@@ -969,7 +768,7 @@ export default function Page() {
 
       <div className="absolute top-4 right-4 z-30 isolate">
         <div className="inline-flex flex-col items-stretch gap-2 bg-transparent">
-          <div className="inline-flex items-center gap-2 rounded-2xl px-2.5 py-1.5 text-[11px] text-slate-300 glass-panel glass-panel--thin neon-edge">
+          <div className="mt-6 inline-flex items-center gap-2 rounded-2xl px-2.5 py-1.5 text-[11px] text-slate-300 glass-panel glass-panel--thin neon-edge">
             {/* Docs dropdown */}
             <div className="relative z-50" ref={docsMenuRef}>
               <button
@@ -984,7 +783,7 @@ export default function Page() {
                 )}
                 title="Documents in data/documents"
               >
-                <span className="max-w-[120px] truncate">{docsButtonLabel}</span>
+                <span className="max-w-30 truncate">{docsButtonLabel}</span>
                 <svg
                   className={cx("h-3 w-3 text-emerald-200 transition-transform", showDocsMenu && "rotate-180")}
                   viewBox="0 0 24 24"
@@ -1002,8 +801,9 @@ export default function Page() {
             {showDocsMenu && docsMenuPos
               ? createPortal(
                 <div
-                  className="fixed z-[9999] w-56 overflow-hidden rounded-xl glass-panel glass-panel--menu"
+                  className="fixed z-9999 w-56 overflow-hidden rounded-xl glass-panel glass-panel--menu"
                   style={{ top: docsMenuPos.top, left: docsMenuPos.left }}
+                  ref={docsMenuPortalRef}
                 >
                   <div className="px-3 py-2 text-[11px] uppercase tracking-[0.35em] text-slate-400">
                     Documents
@@ -1264,15 +1064,11 @@ export default function Page() {
             const f = e.dataTransfer.files?.[0];
             if (f) uploadDoc(f);
           }}
-          title="Drag & drop a file here to upload + index"
         >
           <div className="space-y-3">
             <AnimatePresence>
               {messages.map((m) => {
-                // Format assistant replies to look polished and readable
                 const formatted = m.role === "assistant" ? formatAssistantContent(m) : m.content;
-                const canCopy = !m.error && !m.isLoading && !!m.content;
-                const copyText = m.role === "assistant" ? formatted || "" : m.content || "";
                 return (
                   <motion.div
                     key={m.id}
@@ -1286,31 +1082,20 @@ export default function Page() {
                         : "mr-auto message-ai"
                     )}
                   >
-                    <div className="p-4 flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={cx(
-                            "h-2.5 w-2.5 rounded-full",
-                            m.role === "user"
-                              ? "bg-linear-to-r from-sky-300 to-violet-300"
-                              : "bg-linear-to-r from-slate-300 to-slate-500"
+                    {m.role === "assistant" ? (
+                      <div className="p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="font-semibold">Jarvis</div>
+                          {m.mode && (
+                            <span className="text-xs text-slate-400">
+                              {m.mode}
+                            </span>
                           )}
-                        />
-                        <div className="font-semibold">
-                          {m.role === "user" ? "You" : "Jarvis"}
                         </div>
-                        {m.role === "assistant" && (m.mode || m.task) && (
-                          <span className="text-xs text-slate-400">
-                            {m.mode ? m.mode : ""}
-                            {m.mode && m.task ? " • " : ""}
-                            {m.task ? m.task : ""}
-                          </span>
-                        )}
                       </div>
+                    ) : null}
 
-                    </div>
-
-                    <div className="px-5 pb-5">
+                    <div className={cx("px-5 pb-5", m.role === "user" && "pt-4 text-left")}>
                       {m.role === "assistant" ? (
                         m.isLoading ? (
                           <div className="flex items-center gap-3 text-sm text-slate-300">
@@ -1494,8 +1279,9 @@ export default function Page() {
                 {showModeMenu && modeMenuPos
                   ? createPortal(
                     <div
-                      className="fixed z-[9999] w-60 rounded-2xl glass-panel glass-panel--menu"
+                      className="fixed z-9999 w-60 rounded-2xl glass-panel glass-panel--menu"
                       style={{ top: modeMenuPos.top, left: modeMenuPos.left, backgroundColor: "rgba(5,8,12,0.82)", backdropFilter: "blur(16px)" }}
+                      ref={modeMenuPortalRef}
                     >
                       <div className="px-4 py-3 text-[11px] uppercase tracking-[0.35em] text-slate-400">
                         Modes

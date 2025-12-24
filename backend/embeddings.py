@@ -4,10 +4,8 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 EMBED_MODEL = "nomic-embed-text"
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """
-    Calls Ollama embeddings API for each text.
-    """
     vectors: list[list[float]] = []
+    
     async with httpx.AsyncClient(timeout=120.0) as client:
         for t in texts:
             r = await client.post(
