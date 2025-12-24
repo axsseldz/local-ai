@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from db import init_db, add_memory, search_memory
+from db import init_db
 from fastapi import FastAPI, HTTPException, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -17,7 +17,6 @@ import faiss
 import json
 import asyncio
 import os
-import tempfile
 import subprocess
 import time
 import re
@@ -36,7 +35,6 @@ BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 INDEX_LOCK = asyncio.Lock()
 _METAL_CACHE = {"value": None, "ts": 0.0}
-_WHISPER_MODEL = None 
 _vosk_model = None
 
 FORMAT_RULES = (
@@ -236,7 +234,6 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
             "doc_path": ch["doc_path"],
             "chunk_index": ch["chunk_index"],
             "score": float(src_score) if src_score is not None else None,
-            # small preview for routing gate (and optional UI later)
             "text_preview": (ch["text"] or "")[:500],
         })
 

@@ -48,24 +48,6 @@ def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA_SQL)
-
-def add_memory(content: str, source: str = "manual") -> int:
-    now = datetime.utcnow().isoformat()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO episodic_memory(content, created_at, source) VALUES (?, ?, ?)",
-            (content, now, source),
-        )
-        return int(cur.lastrowid)
-
-def search_memory(query: str, limit: int = 10):
-    like = f"%{query}%"
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, content, created_at, source FROM episodic_memory WHERE content LIKE ? ORDER BY id DESC LIMIT ?",
-            (like, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
     
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -91,11 +73,6 @@ def upsert_document(path_str: str, file_hash: str) -> int:
         )
         return int(row["id"])
 
-def get_document_by_path(path_str: str):
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM documents WHERE path = ?", (path_str,)).fetchone()
-        return dict(row) if row else None
-
 def list_active_document_paths() -> list[str]:
     with get_conn() as conn:
         rows = conn.execute("SELECT path FROM documents WHERE status='active'").fetchall()
@@ -111,11 +88,8 @@ def mark_document_deleted(path_str: str) -> list[int]:
         vector_ids = [int(r["vector_id"]) for r in vec_rows]
 
         conn.execute("UPDATE documents SET status='deleted' WHERE id = ?", (doc_id,))
-        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))  # keep DB clean in strict sync
+        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))  
         return vector_ids
-
-def chunk_exists_for_doc(doc_id: int, file_hash: str) -> bool:
-    return False
 
 def get_doc_hash_and_status(path_str: str):
     with get_conn() as conn:
