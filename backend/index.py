@@ -14,7 +14,7 @@ INDEX_PATHS = [
     DATA_ROOT / "notes",
 ]
 
-SUPPORTED_EXTS = {".pdf", ".txt", ".md"}
+SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".py"}
 
 def iter_files():
     for root in INDEX_PATHS:
@@ -76,7 +76,7 @@ async def run_index():
             continue
 
         text = load_document(path)
-        chunks = chunk_text(text)
+        chunks = chunk_text(text, doc_path=path_str)
         if not chunks:
             skipped_count += 1
             continue

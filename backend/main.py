@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from embeddings import embed_texts
 from faiss_store import search as faiss_search
-from db import get_chunks_by_vector_ids
+from db import get_chunks_by_vector_ids, search_chunks_keyword
 from pathlib import Path
 from datetime import datetime, timezone
 from index import run_index  
@@ -131,6 +131,18 @@ async def _run_index_job(trigger: str):
 
     return True
 
+async def _queue_index_job(trigger: str):
+    if not INDEX_LOCK.locked():
+        asyncio.create_task(_run_index_job(trigger))
+        return
+
+    async def wait_and_run():
+        while INDEX_LOCK.locked():
+            await asyncio.sleep(0.5)
+        await _run_index_job(trigger)
+
+    asyncio.create_task(wait_and_run())
+
 async def _index_daemon(stop_event: asyncio.Event):
     await _run_index_job("startup")
 
@@ -176,7 +188,7 @@ async def brave_web_search(query: str, count: int = 5):
     return results
 
 async def ollama_stream(prompt: str, model: str):
-    num_ctx = 5120 if model == "qwen2.5-coder:14b" else 4072
+    num_ctx = 5120 
     payload = {
         "model": model,
         "prompt": prompt,
@@ -234,8 +246,14 @@ async def _switch_llm_model(next_model: str) -> None:
             await _ollama_unload_model(prev)
         _CURRENT_LLM_MODEL = next_model
     
-async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -> tuple[str | None, list, dict, list[str]]:
-    q_vec = (await embed_texts([question]))[0]
+async def build_local_prompt_and_sources(
+    question: str,
+    task: str,
+    top_k: int,
+    retrieval_query: str,
+) -> tuple[str | None, list, dict, list[str]]:
+    query_text = retrieval_query or question
+    q_vec = (await embed_texts([query_text]))[0]
 
     index = load_faiss_index()
     if index is None:
@@ -245,8 +263,22 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
     if task == "summary":
         k = max(k, 12)
 
-    scores, vector_ids = faiss_search(index, q_vec, top_k=k)
-    chunks = get_chunks_by_vector_ids(vector_ids)
+    scores, vector_ids = faiss_search(index, q_vec, top_k=k * 2)
+    vec_scores = {vid: float(scores[i]) for i, vid in enumerate(vector_ids) if i < len(scores)}
+    kw_hits = search_chunks_keyword(query_text, limit=k * 3)
+    kw_scores = {int(h["vector_id"]): float(h.get("kw_score", 0)) for h in kw_hits}
+
+    max_vec = max(vec_scores.values()) if vec_scores else 1.0
+    max_kw = max(kw_scores.values()) if kw_scores else 1.0
+
+    combined: dict[int, float] = {}
+    for vid, score in vec_scores.items():
+        combined[vid] = (score / max_vec)
+    for vid, score in kw_scores.items():
+        combined[vid] = combined.get(vid, 0.0) + 0.15 * (score / max_kw)
+
+    ranked_ids = sorted(combined.keys(), key=lambda v: combined[v], reverse=True)[:k]
+    chunks = get_chunks_by_vector_ids(ranked_ids)
 
     if not chunks:
         best = float(scores[0]) if scores else 0.0
@@ -263,7 +295,7 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
         context_blocks.append(
             f"[{label}] doc={ch['doc_path']} chunk={ch['chunk_index']}\n{ch['text']}"
         )
-        src_score = scores[i] if i < len(scores) else None
+        src_score = combined.get(int(ch.get("vector_id")), None)
         sources.append({
             "label": label,
             "doc_path": ch["doc_path"],
@@ -272,43 +304,20 @@ async def build_local_prompt_and_sources(question: str, task: str, top_k: int) -
             "text_preview": (ch["text"] or "")[:500],
         })
 
-    if task == "summary":
-        instructions = (
-            "TASK: Summarize using ONLY the provided SOURCES.\n"
-            "You MUST synthesize a summary even if the sources are split across chunks.\n"
-            "Do NOT say 'I don't know' just because a summary isn't explicitly written.\n"
-            "If important sections are missing, make a partial summary and say what seems missing.\n"
-            "Follow the user's format request (e.g. bullet points).\n"
-            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-            "Do NOT cite or mention source IDs or filenames in the answer.\n"
-        )
-    else:
-        instructions = (
-            "TASK: Answer using ONLY the provided SOURCES.\n"
-            "If the answer cannot be found in the sources, say 'I don't know'.\n"
-            "Keep it concise unless the user explicitly asks for a detailed/long answer.\n"
-            "Do NOT cite or mention source IDs or filenames in the answer.\n"
-        )
-
-    prompt = (
-        "You are a local, privacy-first assistant.\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "SOURCES:\n" + "\n\n".join(context_blocks) + "\n\n"
-        f"{instructions}"
-        f"{FORMAT_RULES}\n"
-    )
-
-    best = float(scores[0]) if scores else 0.0
+    best = max(combined.values()) if combined else 0.0
     top3 = [float(x) for x in (scores[:3] if scores else [])]
     avg_top3 = sum(top3) / len(top3) if top3 else 0.0
     gap = (float(scores[0]) - float(scores[1])) if scores and len(scores) > 1 else 0.0
 
-    return prompt, sources, {
+    return None, sources, {
         "top_k": k,
         "best_score": best,
         "avg_top3": avg_top3,
         "score_gap": gap,
         "n_sources": len(sources),
+        "keyword_hits": len(kw_hits),
+        "vector_hits": len(vector_ids),
+        "retrieval_query": query_text,
     }, context_blocks
 
 def _estimate_tokens(text: str) -> int:
@@ -347,6 +356,7 @@ def _build_system_prompt(mode: str, task: str) -> str:
             "Follow the user's format request (e.g. bullet points).",
             "Keep it concise unless the user explicitly asks for a detailed/long answer.",
             "Do NOT cite or mention source IDs or filenames in the answer.",
+            "Treat SOURCES CONTEXT as authoritative.",
         ])
     else:
         lines.extend([
@@ -354,20 +364,40 @@ def _build_system_prompt(mode: str, task: str) -> str:
             "If the answer cannot be found in the sources, say 'I don't know'.",
             "Keep it concise unless the user explicitly asks for a detailed/long answer.",
             "Do NOT cite or mention source IDs or filenames in the answer.",
+            "Treat SOURCES CONTEXT as authoritative.",
         ])
     lines.append(FORMAT_RULES)
     return "\n".join(lines).strip()
 
-def _build_memory_prompt(system_prompt: str, summary: str, messages: list[dict], user_payload: str) -> str:
+def _build_memory_prompt(
+    system_prompt: str,
+    summary: str,
+    sources_block: str,
+    messages: list[dict],
+    user_payload: str,
+) -> str:
     parts = [f"SYSTEM:\n{system_prompt}"]
     if summary:
         parts.append("SYSTEM:\nCONVERSATION CONTEXT (summary):\n" + summary.strip())
+    if sources_block:
+        parts.append("SYSTEM:\nSOURCES CONTEXT:\n" + sources_block.strip())
     if messages:
         rendered = _render_messages(messages)
         if rendered:
             parts.append("RECENT MESSAGES:\n" + rendered)
     parts.append("USER:\n" + user_payload.strip())
     return "\n\n".join(parts).strip()
+
+def _select_top_k(question: str, base: int) -> int:
+    q = (question or "").strip().lower()
+    if not q:
+        return base
+    analytic = ["why", "how", "compare", "analysis", "explain", "summarize", "tradeoff", "pros", "cons"]
+    if any(k in q for k in analytic) or len(q) > 120:
+        return max(base, 10)
+    if len(q) < 60:
+        return max(4, min(base, 6))
+    return base
 
 def _build_summary_prompt(summary: str, messages: list[dict]) -> str:
     parts = [
@@ -379,6 +409,19 @@ def _build_summary_prompt(summary: str, messages: list[dict]) -> str:
     if rendered:
         parts.append("MESSAGES:\n" + rendered)
     return "\n\n".join(parts).strip()
+
+async def _rewrite_query(question: str, model: str) -> str:
+    prompt = (
+        "Rewrite the user question into a concise retrieval query. "
+        "Keep key nouns, entities, and constraints. "
+        "Return only the rewritten query text.\n\n"
+        f"QUESTION:\n{question.strip()}"
+    )
+    try:
+        rewritten = await _ollama_generate(prompt, model)
+        return rewritten.strip() or question
+    except Exception:
+        return question
 
 async def _ollama_generate(prompt: str, model: str) -> str:
     if not prompt:
@@ -615,22 +658,11 @@ async def docs_upload(file: UploadFile = File(...)):
     filename = os.path.basename(file.filename or "upload.bin")
     dest = DOCS_DIR / filename
 
-    if dest.exists():
-        stem = dest.stem
-        suf = dest.suffix
-        i = 1
-        while True:
-            candidate = DOCS_DIR / f"{stem}_{i}{suf}"
-            if not candidate.exists():
-                dest = candidate
-                break
-            i += 1
-
     content = await file.read()
     dest.write_bytes(content)
 
     try:
-        asyncio.create_task(_run_index_job("upload"))
+        await _queue_index_job("upload")
     except Exception:
         pass
 
@@ -687,8 +719,15 @@ async def ask_stream(req: AskRequest):
 
 
         elif mode == "local":
-            prompt, sources, retrieval, context_blocks = await build_local_prompt_and_sources(req.question, task, req.top_k)
-            if prompt is None:
+            adaptive_top_k = _select_top_k(req.question, req.top_k)
+            retrieval_query = await _rewrite_query(req.question, model)
+            prompt, sources, retrieval, context_blocks = await build_local_prompt_and_sources(
+                req.question,
+                task,
+                adaptive_top_k,
+                retrieval_query,
+            )
+            if not sources:
                 meta = {"mode": "local", "task": task, "sources": [], "model": model, "retrieval": retrieval}
                 yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
                 yield f"data: I couldn't find anything relevant in your local documents.\n\n"
@@ -713,10 +752,8 @@ async def ask_stream(req: AskRequest):
             heading = "WEB SOURCES:" if final_mode == "search" else "SOURCES:"
             sources_block = _format_sources_block(context_blocks, heading)
         user_payload = f"QUESTION:\n{req.question}"
-        if sources_block:
-            user_payload = f"{user_payload}\n\n{sources_block}"
 
-        prompt = _build_memory_prompt(system_prompt, summary, recent_messages, user_payload)
+        prompt = _build_memory_prompt(system_prompt, summary, sources_block, recent_messages, user_payload)
         est_tokens = _estimate_tokens(prompt)
 
         if est_tokens > MAX_CONTEXT_TOKENS and recent_messages:
@@ -733,7 +770,7 @@ async def ask_stream(req: AskRequest):
                 state["messages"] = pruned_messages
             summary = new_summary
             recent_messages = pruned_messages
-            prompt = _build_memory_prompt(system_prompt, summary, recent_messages, user_payload)
+            prompt = _build_memory_prompt(system_prompt, summary, sources_block, recent_messages, user_payload)
 
         meta = {
             "mode": final_mode,

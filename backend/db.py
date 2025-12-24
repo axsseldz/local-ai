@@ -1,5 +1,6 @@
 import sqlite3
 import hashlib
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -129,3 +130,49 @@ def get_chunks_by_vector_ids(vector_ids: list[int]) -> list[dict]:
         items = [dict(r) for r in rows]
         items.sort(key=lambda x: order.get(int(x["vector_id"]), 10**9))
         return items
+
+def search_chunks_keyword(query: str, limit: int = 30) -> list[dict]:
+    terms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query or "") if len(t) >= 3]
+    if not terms:
+        return []
+    terms = terms[:6]
+
+    where_parts = []
+    params: list[str] = []
+    for t in terms:
+        like = f"%{t}%"
+        where_parts.append("(lower(c.text) LIKE ? OR lower(d.path) LIKE ?)")
+        params.extend([like, like])
+
+    where_sql = " OR ".join(where_parts)
+    sql = f"""
+    SELECT
+      c.vector_id,
+      c.chunk_index,
+      c.text,
+      d.path AS doc_path
+    FROM chunks c
+    JOIN documents d ON d.id = c.doc_id
+    WHERE d.status='active' AND ({where_sql})
+    LIMIT ?
+    """
+    params.append(int(limit))
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        items = [dict(r) for r in rows]
+
+    scored = []
+    for it in items:
+        text = (it.get("text") or "").lower()
+        path = (it.get("doc_path") or "").lower()
+        score = 0
+        for t in terms:
+            score += text.count(t)
+            score += 2 * path.count(t)
+        if score > 0:
+            it["kw_score"] = score
+            scored.append(it)
+
+    scored.sort(key=lambda x: x.get("kw_score", 0), reverse=True)
+    return scored[:limit]

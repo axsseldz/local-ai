@@ -761,7 +761,7 @@ export default function Page() {
     general: "General",
     search: "Search",
   };
-  const modelOptions = ["llama3.1:8b", "qwen2.5-coder:14b"];
+  const modelOptions = ["llama3.1:8b", "qwen2.5-coder:7b"];
   const modeIcons: Record<Mode, () => JSX.Element> = {
     general: () => (
       <svg
