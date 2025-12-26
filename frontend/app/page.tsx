@@ -154,6 +154,7 @@ export default function Page() {
   const [modeMenuPos, setModeMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [modelMenuPos, setModelMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const spokenRef = useRef<string>("");
   const finalTranscriptRef = useRef<string>("");
@@ -861,66 +862,114 @@ export default function Page() {
         <RadarBackground />
       </div>
 
-      <div className="absolute top-4 left-4 z-20">
-        <div className="mt-6 relative w-60 overflow-hidden rounded-2xl glass-panel neon-edge px-3 py-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="relative" ref={modelMenuRef}>
-              <button
-                type="button"
-                onClick={() => setShowModelMenu((v) => !v)}
-                ref={modelButtonRef}
-                className={cx(
-                  "inline-flex items-center gap-2 rounded-lg border bg-transparent px-3 py-2 text-[12px] font-semibold text-slate-200 transition",
-                  showModelMenu
-                    ? "border-cyan-300/70 bg-cyan-500/15 text-cyan-100"
-                    : "border-slate-800/70 hover:border-cyan-300/60 hover:text-cyan-100"
-                )}
-                title="Choose model"
-              >
-                <span className="max-w-44 truncate">Model: {model}</span>
-                <svg
-                  className={cx("h-3.5 w-3.5 text-cyan-200 transition-transform", showModelMenu && "rotate-180")}
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.6"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M6 9l6 6 6-6" />
-                </svg>
-              </button>
-            </div>
-            <motion.svg
-              className="h-15 w-15 text-cyan-200/80"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+      <AnimatePresence>
+        {isSidebarOpen && (
+          <>
+            <motion.div
+              className="fixed inset-0 z-30 bg-transparent backdrop-blur-md"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              transition={{ duration: 0.4, ease: "easeOut" }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              onClick={() => setIsSidebarOpen(false)}
               aria-hidden="true"
+            />
+            <motion.aside
+              className="fixed left-0 top-0 z-40 h-full w-70 max-w-[80vw] overflow-y-auto border-0 bg-slate-950/90 px-5 pb-6 pt-5 shadow-[0_0_40px_rgba(12,255,220,0.08)] glass-panel glass-panel--input"
+              initial={{ x: "-100%" }}
+              animate={{ x: 0 }}
+              exit={{ x: "-100%" }}
+              transition={{ type: "spring", stiffness: 220, damping: 26 }}
+              role="dialog"
+              aria-label="Sidebar"
             >
-              <motion.path
-                d="M7 7h10v10H7z"
-                strokeDasharray="40"
-                strokeDashoffset="40"
-                animate={{ strokeDashoffset: [40, 0, 40] }}
-                transition={{ duration: 3.2, repeat: Infinity, ease: "easeInOut" }}
-              />
-              <motion.path
-                d="M9 12h6"
-                strokeDasharray="12"
-                strokeDashoffset="12"
-                animate={{ strokeDashoffset: [12, 0, 12] }}
-                transition={{ duration: 2.6, repeat: Infinity, ease: "easeInOut", delay: 0.2 }}
-              />
-            </motion.svg>
+              <div className="flex items-center justify-between">
+                <div className="text-xs uppercase tracking-[0.4em] text-slate-400">
+                  Navigation
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsSidebarOpen(false)}
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-lg border-0 text-cyan-100 transition hover:text-cyan-50"
+                  aria-label="Close sidebar"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M6 6l12 12" />
+                    <path d="M18 6l-12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="mt-6 space-y-3 text-sm text-slate-300">
+                <div className="rounded-xl border-0 bg-cyan-500/10 px-4 py-3">
+                  Add your sidebar content here.
+                </div>
+              </div>
+            </motion.aside>
+          </>
+        )}
+      </AnimatePresence>
+
+      <div className="absolute top-4 left-4 z-20">
+ <div className="mt-6 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setIsSidebarOpen(true)}
+            className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border-0 text-cyan-100 shadow-[0_0_18px_rgba(45,212,191,0.2)] transition hover:bg-cyan-500/10 glass-panel glass-panel--input"
+            aria-label="Open sidebar"
+          >
+
+            <svg
+
+              viewBox="0 0 24 24"
+              className="h-5 w-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+
+            >
+   <path d="M4 6h16" />
+              <path d="M4 12h16" />
+              <path d="M4 18h16" />
+            </svg>
+          </button>
+          <div className="relative" ref={modelMenuRef}>
+            <button
+              type="button"
+              onClick={() => setShowModelMenu((v) => !v)}
+              ref={modelButtonRef}
+              className={cx(
+                "inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-800/70 bg-transparent px-4 text-[12px] font-semibold text-slate-200 transition hover:border-cyan-300/60 hover:text-cyan-100",
+                showModelMenu && "border-cyan-300/70 bg-cyan-500/15 text-cyan-100"
+              )}
+              title="Choose model"
+            >
+              <span className="max-w-44 truncate">Model: {model}</span>
+              <svg
+                className={cx("h-3.5 w-3.5 text-cyan-200 transition-transform", showModelMenu && "rotate-180")}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+  
+          <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
           </div>
+          
         </div>
         {showModelMenu && modelMenuPos
           ? createPortal(
@@ -971,7 +1020,7 @@ export default function Page() {
           )
           : null}
       </div>
-
+          
       <div className="absolute top-4 right-4 z-30 isolate">
         <div className="inline-flex flex-col items-stretch gap-2 bg-transparent">
           <div className="mt-6 inline-flex items-center gap-2 rounded-2xl px-2.5 py-1.5 text-[11px] text-slate-300 glass-panel glass-panel--thin neon-edge">
