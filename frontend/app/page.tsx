@@ -979,6 +979,27 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("jarvis_summaries");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as SummaryItem[];
+      if (Array.isArray(parsed)) setSummaries(parsed);
+    } catch {
+      // ignore corrupted local data
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem("jarvis_summaries", JSON.stringify(summaries));
+    } catch {
+      // ignore storage failures
+    }
+  }, [summaries]);
+
+  useEffect(() => {
     if (indexStatus?.state === "ok" && !indexStatus?.is_indexing) {
       fetchDocs();
     }
