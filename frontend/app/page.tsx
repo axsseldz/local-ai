@@ -104,6 +104,37 @@ function uid(prefix = "m") {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function renderPromptPreview(text: string) {
+  const tokens = text.split(/(\s+)/);
+  return tokens.map((token, idx) => {
+    if (token === "/agent") {
+      return (
+        <span
+          key={`cmd_${idx}`}
+          className="rounded-sm bg-emerald-500/10 text-emerald-200/90"
+        >
+          {token}
+        </span>
+      );
+    }
+    return <span key={`txt_${idx}`}>{token}</span>;
+  });
+}
+
+function enforceSingleAgentCommand(input: string) {
+  const pattern = /(^|\s)\/agent(?=\s|$)/g;
+  const matches = [...input.matchAll(pattern)];
+  if (matches.length <= 1) return input;
+  let kept = 0;
+  return input.replace(pattern, (match) => {
+    if (kept === 0) {
+      kept += 1;
+      return match;
+    }
+    return match.replace("/agent", "").replace(/\s{2,}/g, " ");
+  });
+}
+
 function floatTo16BitPCM(float32: Float32Array) {
   const out = new Int16Array(float32.length);
   for (let i = 0; i < float32.length; i++) {
@@ -168,6 +199,8 @@ export default function Page() {
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const modelButtonRef = useRef<HTMLButtonElement | null>(null);
   const modelMenuPortalRef = useRef<HTMLDivElement | null>(null);
+  const promptOverlayRef = useRef<HTMLDivElement | null>(null);
+  const questionInputRef = useRef<HTMLTextAreaElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -717,6 +750,34 @@ export default function Page() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       ask();
+    }
+  }
+
+  function onQuestionChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    const raw = e.currentTarget.value;
+    const cursor = e.currentTarget.selectionStart ?? raw.length;
+    const sanitized = enforceSingleAgentCommand(raw);
+    const shouldPad = cursor === sanitized.length && /(^|\s)\/agent$/.test(sanitized);
+    if (shouldPad) {
+      const padded = `${sanitized} `;
+      setQuestion(padded);
+      requestAnimationFrame(() => {
+        if (questionInputRef.current) {
+          questionInputRef.current.selectionStart = padded.length;
+          questionInputRef.current.selectionEnd = padded.length;
+        }
+      });
+      return;
+    }
+    setQuestion(sanitized);
+    if (sanitized !== raw) {
+      requestAnimationFrame(() => {
+        if (questionInputRef.current) {
+          const nextPos = Math.min(cursor - 6, sanitized.length);
+          questionInputRef.current.selectionStart = nextPos;
+          questionInputRef.current.selectionEnd = nextPos;
+        }
+      });
     }
   }
 
@@ -1553,13 +1614,35 @@ export default function Page() {
         {/* input at bottom */}
         <div className="rounded-3xl h-29 mt-2 mb-8 mx-auto w-full max-w-450 glass-panel glass-panel--input neon-edge">
           <div className="p-4">
-            <textarea
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder='Ask Jarvis something, or click the microphone to speak...'
-              className="w-full min-h-5 resize-none bg-transparent text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-500 font-mono"
-            />
+            <div className="relative">
+              <div
+                ref={promptOverlayRef}
+                aria-hidden
+                className="pointer-events-none absolute inset-0 box-border overflow-hidden whitespace-pre-wrap wrap-break-word bg-transparent text-sm leading-relaxed text-slate-100 font-mono p-0"
+              >
+                {question ? (
+                  renderPromptPreview(question)
+                ) : (
+                  <span className="text-slate-500">
+                    Ask Jarvis something, or click the microphone to speak...
+                  </span>
+                )}
+              </div>
+              <textarea
+                ref={questionInputRef}
+                value={question}
+                onChange={onQuestionChange}
+                onKeyDown={onKeyDown}
+                onScroll={(e) => {
+                  if (promptOverlayRef.current) {
+                    promptOverlayRef.current.scrollTop = e.currentTarget.scrollTop;
+                    promptOverlayRef.current.scrollLeft = e.currentTarget.scrollLeft;
+                  }
+                }}
+                placeholder="Ask Jarvis something, or click the microphone to speak..."
+                className="w-full min-h-5 resize-none bg-transparent text-sm leading-relaxed text-transparent caret-slate-100 outline-none placeholder:text-transparent font-mono box-border p-0"
+              />
+            </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2">
