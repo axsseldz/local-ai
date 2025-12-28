@@ -226,6 +226,7 @@ export default function Page() {
   const [question, setQuestion] = useState("");
   const [mode, setMode] = useState<Mode>("general");
   const [model, setModel] = useState("llama3.1:8b");
+  const [modelOptions, setModelOptions] = useState<string[]>(["llama3.1:8b", "qwen2.5-coder:7b", "gpt-oss:20b"]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -369,6 +370,41 @@ export default function Page() {
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [showModeMenu, showDocsMenu, showModelMenu]);
+
+  useEffect(() => {
+    let alive = true;
+
+    const loadModels = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/api/models");
+        if (!res.ok) throw new Error(`models request failed: ${res.status}`);
+        const data = await res.json();
+        const list = Array.isArray(data?.models)
+          ? data.models.filter((m: unknown): m is string => typeof m === "string")
+          : [];
+        if (!alive) return;
+        if (list.length) {
+          setModelOptions(list);
+          setModel((prev) => {
+            if (prev && list.includes(prev)) return prev;
+            const defaultModel =
+              typeof data?.default === "string" && list.includes(data.default) ? data.default : null;
+            return defaultModel || list[0] || prev || "llama3.1:8b";
+          });
+        }
+      } catch {
+        if (!alive) return;
+        setModelOptions((prev) =>
+          prev.length ? prev : ["llama3.1:8b", "qwen2.5-coder:7b", "gpt-oss:20b"]
+        );
+      }
+    };
+
+    loadModels();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const jarvisVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
 
@@ -1036,7 +1072,6 @@ export default function Page() {
     general: "General",
     search: "Search",
   };
-  const modelOptions = ["llama3.1:8b", "qwen2.5-coder:7b"];
   const modeIcons: Record<Mode, () => JSX.Element> = {
     general: () => (
       <svg

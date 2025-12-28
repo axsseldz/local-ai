@@ -26,7 +26,13 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "llama3.1:8b"
+AVAILABLE_MODELS = [
+    "llama3.1:8b",
+    "qwen2.5-coder:7b",
+    "gpt-oss:20b",
+]
+DEFAULT_MODEL = AVAILABLE_MODELS[0]
+CONTEXT_WINDOW_TOKENS = 5000
 DOCS_DIR = BASE_DIR / "data" / "documents"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_INTERVAL_SECONDS = 180 
@@ -258,13 +264,12 @@ async def _build_web_context(query: str, results: list[dict]) -> tuple[list[dict
     return final_enriched, final_blocks
 
 async def ollama_stream(prompt: str, model: str):
-    num_ctx = 5120 
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": True, 
         "options": {
-            "num_ctx": num_ctx,
+            "num_ctx": CONTEXT_WINDOW_TOKENS,
             "temperature": 0.6,
         },
     }
@@ -411,6 +416,7 @@ async def _ollama_generate(prompt: str, model: str) -> str:
         "prompt": prompt,
         "stream": False,
         "options": {
+            "num_ctx": CONTEXT_WINDOW_TOKENS,
             "temperature": 0.3,
         },
     }
@@ -742,6 +748,10 @@ def load_faiss_index():
     if not isinstance(idx, faiss.IndexIDMap2):
         idx = faiss.IndexIDMap2(idx)
     return idx
+
+@app.get("/api/models")
+def list_models():
+    return {"models": AVAILABLE_MODELS, "default": DEFAULT_MODEL}
 
 @app.get("/api/metrics")
 def metrics():
